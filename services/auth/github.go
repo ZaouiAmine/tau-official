@@ -49,6 +49,8 @@ type UserRepositoriesResponse struct {
 
 type UserProjectsResponse struct {
 	Projects []ProjectInfo `json:"projects"`
+	// Newest says Projects are the most recent first, cut to what was asked for.
+	Newest bool `json:"newest,omitempty"`
 }
 
 type RepositoryDetails struct {
@@ -87,29 +89,31 @@ type UserResponse struct {
 	User UserInfo `json:"user"`
 }
 
-func generateKey() (string, string, string, error) {
+// generateKey makes a deploy key pair: the public half as an authorized_keys
+// line, the private half PEM encoded.
+func generateKey() (string, string, error) {
 	_privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
 
 	privateKey, err := x509.MarshalECPrivateKey(_privateKey)
 	if err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
 
 	privateKeyPEM := &pem.Block{Type: "EC PRIVATE KEY", Bytes: privateKey}
 	var private bytes.Buffer
 	if err := pem.Encode(&private, privateKeyPEM); err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
 
 	pub, err := ssh.NewPublicKey(&_privateKey.PublicKey)
 	if err != nil {
-		return "", "", "", err
+		return "", "", err
 	}
 
-	return deployKeyName, string(ssh.MarshalAuthorizedKey(pub)), private.String(), nil
+	return string(ssh.MarshalAuthorizedKey(pub)), private.String(), nil
 }
 
 // repoAccess reports whether the caller may act on a repository. GetByID already
@@ -151,6 +155,8 @@ func (srv *AuthService) authorizeProject(client GitHubClient, project projects.P
 }
 
 func (srv *AuthService) registerGitHubRepository(ctx context.Context, client GitHubClient, repoID string) (*RepositoryRegistrationResponse, error) {
+	defer forgetRepoList(client)
+
 	// If client is nil (P2P calls), skip GitHub API verification
 	if client != nil {
 		if !repoAccess(client, repoID) {
@@ -184,7 +190,11 @@ func (srv *AuthService) registerGitHubRepository(ctx context.Context, client Git
 		secret = "mock-secret"
 	}
 
-	kname, kpub, kpriv, err := generateKey()
+	kname := srv.deployKeyName
+	if kname == "" {
+		kname = deployKeyTitle(srv.devMode, "")
+	}
+	kpub, kpriv, err := generateKey()
 	if err != nil {
 		return nil, fmt.Errorf("generate key failed with %s", err)
 	}
@@ -193,6 +203,11 @@ func (srv *AuthService) registerGitHubRepository(ctx context.Context, client Git
 		err = client.CreateDeployKey(&kname, &kpub)
 		if err != nil {
 			return nil, fmt.Errorf("create deploy key failed with: %s", err)
+		}
+		// the new key works before older ones go, so the repository is never
+		// without one; a key left behind is reported, not fatal
+		if err := client.RemoveOtherDeployKeys(kname, kpub); err != nil {
+			logger.Errorf("removing old deploy keys of repository %s failed: %s", repoID, err)
 		}
 	}
 
@@ -272,6 +287,8 @@ func (srv *AuthService) registerGitHubRepository(ctx context.Context, client Git
 }
 
 func (srv *AuthService) unregisterGitHubRepository(ctx context.Context, client GitHubClient, repoID string) error {
+	defer forgetRepoList(client)
+
 	// If client is nil (P2P calls), skip GitHub API verification
 	if client != nil {
 		// Registering already required write access and tenancy ownership;
@@ -324,6 +341,8 @@ func (srv *AuthService) unregisterGitHubRepository(ctx context.Context, client G
 }
 
 func (srv *AuthService) newGitHubProject(ctx context.Context, client GitHubClient, projectID, projectName, configID, codeID string) (*ProjectCreateResponse, error) {
+	defer forgetRepoList(client)
+
 	logger.Debug("Creating project " + projectName)
 
 	logger.Debug("Project ID=" + projectID)
@@ -392,7 +411,10 @@ func (srv *AuthService) newGitHubProject(ctx context.Context, client GitHubClien
 }
 
 func (srv *AuthService) getGitHubUserRepositories(ctx context.Context, client GitHubClient) (*UserRepositoriesResponse, error) {
-	repos := client.ListMyRepos()
+	repos, err := client.ListMyRepos()
+	if err != nil {
+		return nil, err
+	}
 	logger.Debugf("User repos:%v", repos)
 
 	user_repos := make(map[string]RepositoryInfo, 0)
@@ -413,9 +435,42 @@ func (srv *AuthService) getGitHubUserRepositories(ctx context.Context, client Gi
 	}, nil
 }
 
+// getGitHubRecentProjects is the caller's last projects, newest first: those of
+// its most recently created repositories, read until there are enough.
+func (srv *AuthService) getGitHubRecentProjects(ctx context.Context, client GitHubClient, last int) (*UserProjectsResponse, error) {
+	seen := make(map[string]bool)
+	projectsFound := make([]ProjectInfo, 0, last)
+	err := client.EachRepoPage(func(ids []string) bool {
+		for _, repoID := range ids {
+			v, err := srv.db.Get(ctx, fmt.Sprintf("/repositories/github/%s/project", repoID))
+			if err != nil || len(v) == 0 || seen[string(v)] {
+				continue
+			}
+			project, err := projects.Fetch(ctx, srv.KV(), string(v))
+			if err != nil {
+				continue
+			}
+			seen[string(v)] = true
+			projectsFound = append(projectsFound, ProjectInfo{ID: string(v), Name: project.Name()})
+			if len(projectsFound) >= last {
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &UserProjectsResponse{Projects: projectsFound, Newest: true}, nil
+}
+
 func (srv *AuthService) getGitHubUserProjects(ctx context.Context, client GitHubClient) (*UserProjectsResponse, error) {
 	user_projects := make(map[string]ProjectInfo, 0)
-	for repo_id := range client.ListMyRepos() {
+	repos, err := client.ListMyRepos()
+	if err != nil {
+		return nil, err
+	}
+	for repo_id := range repos {
 		repo_key := fmt.Sprintf("/repositories/github/%s/project", repo_id)
 		v, err := srv.db.Get(ctx, repo_key)
 		if err == nil && len(v) > 0 {

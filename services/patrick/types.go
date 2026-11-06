@@ -44,6 +44,8 @@ type PatrickService struct {
 	raftCluster    raft.Cluster
 	jobQueue       raft.Queue
 	outboundClient *streamClient.Client
+	liveLogs       *liveLogs
+	liveLogSenders liveLogSenders
 
 	config tauConfig.Config
 }

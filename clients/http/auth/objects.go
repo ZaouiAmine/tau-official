@@ -15,6 +15,14 @@ type CreateProjectData struct {
 	Code   Repository `json:"code"`
 }
 
+// ImportProjectData registers a project under the id its config already
+// carries, so every cloud a project is imported into knows it by that id.
+type ImportProjectData struct {
+	Config    Repository `json:"config"`
+	Code      Repository `json:"code"`
+	ProjectID string     `json:"project-id"`
+}
+
 // Repository is the data that is sent to the server to register a repository or
 // for creating a project
 type Repository struct {
@@ -49,6 +57,7 @@ type Cors struct {
 // ProjectsReturn is the data that is returned from the server when listing projects
 type ProjectsReturn struct {
 	Projects []*Project `json:"projects"`
+	Newest   bool       `json:"newest,omitempty"`
 }
 
 // UserData is the data that is returned from the server when getting user data

@@ -17,6 +17,10 @@ type mockClient struct {
 	retryFunc   func(jid string) (any, error)
 }
 
+func (m *mockClient) JobsLast(projectId string, last int) ([]string, error) {
+	return m.Jobs(projectId)
+}
+
 func (m *mockClient) Jobs(projectId string) ([]string, error) {
 	if m.jobsFunc != nil {
 		return m.jobsFunc(projectId)
@@ -36,6 +40,10 @@ func (m *mockClient) LogFile(jobId, resourceId string) (io.ReadCloser, error) {
 		return m.logFileFunc(jobId, resourceId)
 	}
 	return nil, nil
+}
+
+func (m *mockClient) StreamLogs(jid string, w io.Writer) error {
+	return nil
 }
 
 func (m *mockClient) Cancel(jid string) (interface{}, error) {

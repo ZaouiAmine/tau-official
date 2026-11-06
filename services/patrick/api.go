@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -166,7 +168,10 @@ func (p *PatrickService) infoHandler(ctx context.Context, jid string) (cr.Respon
 func (p *PatrickService) dequeueHandler(ctx context.Context, conn streams.Connection) (cr.Response, error) {
 	id, _, err := p.jobQueue.Pop(5 * time.Second)
 	if err != nil {
-		if errors.Is(err, raft.ErrQueueEmpty) {
+		// A follower cannot pop, and removes nothing trying: it has no job to
+		// give, which is an answer, not a failure. The monkey asks the next
+		// Patrick, and the leader hands the job out.
+		if errors.Is(err, raft.ErrQueueEmpty) || errors.Is(err, raft.ErrNotLeader) {
 			return cr.Response{"available": false}, nil
 		}
 		return nil, fmt.Errorf("queue pop: %w", err)
@@ -229,6 +234,9 @@ func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log
 		if job.Attempt == servicesCommon.MaxJobAttempts {
 			job.Status = commonIface.JobStatusFailed
 			job.Logs = cid_log
+			if err := p.recordLogOwner(ctx, jid, cid_log); err != nil {
+				return fmt.Errorf("recording owners of job %s logs failed with %w", jid, err)
+			}
 
 			jobData, err := cbor.Marshal(job)
 			if err != nil {
@@ -265,7 +273,7 @@ func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log
 			return err
 		}
 
-		if err = p.jobQueue.Push(jid, nil, 5*time.Second); err != nil {
+		if err = p.enqueue(jid); err != nil {
 			return fmt.Errorf("failed to push job %s back onto queue: %w", jid, err)
 		}
 
@@ -321,6 +329,9 @@ func (p *PatrickService) updateStatus(ctx context.Context, pid peer.ID, jid stri
 		job.Logs = cid_log
 		job.AssetCid = assetCid
 		job.Attempt++
+		if err := p.recordLogOwner(ctx, jid, cid_log); err != nil {
+			return fmt.Errorf("recording owners of job %s logs failed with %w", jid, err)
+		}
 	}
 
 	jobData, err := cbor.Marshal(job)
@@ -384,12 +395,33 @@ func (srv *PatrickService) projectAllJobHandler(ctx http.Context) (interface{}, 
 		jids[idx] = strings.TrimPrefix(jobKey, prefix)
 	}
 
+	// ?last=N: the N most recent, newest first, so a client fetches only those
+	if last, err := strconv.Atoi(ctx.Request().URL.Query().Get("last")); err == nil && last > 0 {
+		jids = srv.newestJobs(ctx.Request().Context(), jids, last)
+	}
+
 	data := project{
 		ProjectId: projectId,
 		JobIds:    jids,
 	}
 
 	return data, nil
+}
+
+// newestJobs orders jobs newest first and keeps last of them. A job that cannot
+// be read sorts as oldest.
+func (srv *PatrickService) newestJobs(ctx context.Context, jids []string, last int) []string {
+	stamps := make(map[string]int64, len(jids))
+	for _, jid := range jids {
+		if job, err := srv.anyJob(ctx, jid); err == nil {
+			stamps[jid] = job.Timestamp
+		}
+	}
+	sort.SliceStable(jids, func(i, j int) bool { return stamps[jids[i]] > stamps[jids[j]] })
+	if len(jids) > last {
+		jids = jids[:last]
+	}
+	return jids
 }
 
 func (srv *PatrickService) projectJobHandler(ctx http.Context) (iface interface{}, err error) {
@@ -525,13 +557,18 @@ func (srv *PatrickService) retryJob(ctx http.Context) (iface interface{}, err er
 			return nil, fmt.Errorf("failed deleting job %s with error: %w", jid, err)
 		}
 
+		// its next run writes a new log from the start
+		if srv.liveLogs != nil {
+			srv.liveLogs.reset(job.Id)
+		}
+
 		err = srv.db.Put(requestCtx, "/jobs/"+job.Id, job_byte)
 		if err != nil {
 			logger.Errorf("failed putting job %s into database with error: %s", job.Id, err.Error())
 			return nil, fmt.Errorf("failed putting job %s with %w", job.Id, err)
 		}
 
-		if err = srv.jobQueue.Push(job.Id, nil, 5*time.Second); err != nil {
+		if err = srv.enqueue(job.Id); err != nil {
 			return nil, fmt.Errorf("failed to push retried job %s onto queue: %w", job.Id, err)
 		}
 
@@ -658,7 +695,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.projectAllJobHandler,
+		Handler: srv.withProjectAccess(srv.projectAllJobHandler),
 	})
 
 	srv.http.GET(&http.RouteDefinition{
@@ -671,7 +708,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.projectJobHandler,
+		Handler: srv.withJobAccess("jid", srv.projectJobHandler),
 	})
 
 	srv.http.GET(&http.RouteDefinition{
@@ -680,7 +717,11 @@ func (srv *PatrickService) setupJobRoutes() {
 		Vars: http.Variables{
 			Required: []string{"jobId", "resourceId"},
 		},
-		Handler:     srv.downloadAsset,
+		Auth: http.RouteAuthHandler{
+			Validator: srv.GitHubTokenHTTPAuth,
+			GC:        srv.GitHubTokenHTTPAuthCleanup,
+		},
+		Handler:     srv.withJobAccess("jobId", srv.downloadAsset),
 		RawResponse: true,
 	})
 
@@ -694,8 +735,21 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler:     srv.cidHandler,
+		Handler:     srv.withLogAccess(srv.cidHandler),
 		RawResponse: true,
+	})
+
+	srv.http.WebSocket(&http.WebSocketDefinition{
+		Hosts: hosts,
+		Path:  "/stream/logs/{jid}",
+		Vars: http.Variables{
+			Required: []string{"jid"},
+		},
+		Auth: http.RouteAuthHandler{
+			Validator: srv.GitHubTokenHTTPAuth,
+			GC:        srv.GitHubTokenHTTPAuthCleanup,
+		},
+		NewHandler: srv.newLogStream,
 	})
 
 	srv.http.POST(&http.RouteDefinition{
@@ -708,7 +762,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.cancelJob,
+		Handler: srv.withJobAccess("jid", srv.cancelJob),
 	})
 
 	srv.http.POST(&http.RouteDefinition{
@@ -721,7 +775,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.retryJob,
+		Handler: srv.withJobAccess("jid", srv.retryJob),
 	})
 
 }
@@ -737,7 +791,7 @@ func (srv *PatrickService) GitHubTokenHTTPAuth(ctx http.Context) (interface{}, e
 		}
 		ctx.SetVariable("GithubClient", client)
 		ctx.SetVariable("GithubClientDone", rctx_cancel)
-		logger.Debugf("[GitHubTokenHTTPAuth] ctx=%v", ctx.Variables())
+		logger.Debugf("[GitHubTokenHTTPAuth] %s", ctx.Request().URL.Path) // never the variables: they hold the token
 		return nil, nil
 	}
 	return nil, errors.New("valid Github token required")

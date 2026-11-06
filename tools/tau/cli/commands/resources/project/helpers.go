@@ -3,7 +3,9 @@ package project
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/google/go-github/v71/github"
@@ -17,6 +19,7 @@ import (
 	projectLib "github.com/taubyte/tau/tools/tau/lib/project"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/oauth2"
+	"gopkg.in/yaml.v3"
 )
 
 // See if they have cloned the project, if not show help
@@ -104,6 +107,43 @@ func newGithubClient(ctx context.Context, token string) *github.Client {
 
 	tc := oauth2.NewClient(ctx, ts)
 	return github.NewClient(tc)
+}
+
+// GetRepo looks one repository up by its full name (owner/name).
+var GetRepo = func(ctx context.Context, token, fullName string) (*github.Repository, error) {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return nil, fmt.Errorf("repository %q is not owner/name", fullName)
+	}
+	repo, _, err := newGithubClient(ctx, token).Repositories.Get(ctx, owner, name)
+	return repo, err
+}
+
+// ConfigProjectID reads the project id from config.yaml in a config repository
+// (owner/name) on its default branch; "" when the file holds none.
+var ConfigProjectID = func(ctx context.Context, token, fullName string) (string, error) {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return "", fmt.Errorf("repository %q is not owner/name", fullName)
+	}
+	file, _, _, err := newGithubClient(ctx, token).Repositories.GetContents(ctx, owner, name, "config.yaml", nil)
+	if err != nil {
+		return "", err
+	}
+	if file == nil {
+		return "", fmt.Errorf("config.yaml of %s is not a file", fullName)
+	}
+	content, err := file.GetContent()
+	if err != nil {
+		return "", err
+	}
+	var config struct {
+		Id string `yaml:"id"`
+	}
+	if err := yaml.Unmarshal([]byte(content), &config); err != nil {
+		return "", fmt.Errorf("reading config.yaml of %s failed with: %w", fullName, err)
+	}
+	return config.Id, nil
 }
 
 // Var to allow override in tests

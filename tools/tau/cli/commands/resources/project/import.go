@@ -45,8 +45,19 @@ func _import(ctx *cli.Context) error {
 		return err
 	}
 
-	repos, err := ListRepos(ctx.Context, profile.Token, profile.GitUsername)
-	if err != nil {
+	// Named repositories are looked up by name. Listing every repository took
+	// several GitHub calls on a large account, and one failed page failed the
+	// import; the list is only needed to offer a choice.
+	var repos []*github.Repository
+	if ctx.String("config") != "" && ctx.String("code") != "" {
+		for _, name := range []string{ctx.String("config"), ctx.String("code")} {
+			repo, err := GetRepo(ctx.Context, profile.Token, name)
+			if err != nil {
+				return repositoryI18n.ErrorListRepositories(profile.GitUsername, err)
+			}
+			repos = append(repos, repo)
+		}
+	} else if repos, err = ListRepos(ctx.Context, profile.Token, profile.GitUsername); err != nil {
 		return err
 	}
 
@@ -116,7 +127,18 @@ func _import(ctx *cli.Context) error {
 		return repositoryI18n.RegisteringRepositoryFailed(configRepoName, err)
 	}
 
-	if err = clientProject.Create(auth, configId, codeId); err != nil {
+	// A project with an id keeps it: its builds are filed under the id in its
+	// config, so a cloud that gave it a new one served none of them.
+	projectID, err := ConfigProjectID(ctx.Context, profile.Token, configRepoName)
+	if err != nil {
+		return projectI18n.CreatingProjectFailed(fmt.Errorf("reading the project id from %s failed with: %w", configRepoName, err))
+	}
+	if projectID != "" {
+		err = clientProject.Import(auth, projectID, configId, codeId)
+	} else {
+		err = clientProject.Create(auth, configId, codeId)
+	}
+	if err != nil {
 		return projectI18n.CreatingProjectFailed(err)
 	}
 

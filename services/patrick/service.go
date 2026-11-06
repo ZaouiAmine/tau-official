@@ -101,6 +101,16 @@ func New(ctx context.Context, cfg tauConfig.Config) (*PatrickService, error) {
 		defer srv.http.Start()
 	}
 
+	if err = srv.startLiveLogs(srv.ctx); err != nil {
+		return nil, fmt.Errorf("subscribing to live logs failed with: %w", err)
+	}
+
+	go func() {
+		if err := srv.backfillLogOwners(srv.ctx); err != nil && srv.ctx.Err() == nil {
+			logger.Errorf("recording the owners of older logs failed: %s", err)
+		}
+	}()
+
 	srv.setupHTTPRoutes()
 
 	// Go routine to re announce any pending jobs (queue-based or pubsub-based)
