@@ -3,6 +3,8 @@ on:
     # run only against tags
     tags:
       - '*'
+    tags-ignore:
+      - '*-fork.*'
 
 # GoReleaser publishes the GitHub release with the job's own token.
 permissions:
