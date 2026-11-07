@@ -3,11 +3,15 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	authIface "github.com/taubyte/tau/core/services/auth"
 	iface "github.com/taubyte/tau/core/services/patrick"
 	http "github.com/taubyte/tau/pkg/http"
+	"github.com/taubyte/tau/pkg/platformerr"
 	servicesCommon "github.com/taubyte/tau/services/common"
 	"gopkg.in/go-playground/webhooks.v5/github"
 
@@ -26,6 +31,9 @@ import (
 func (srv *PatrickService) githubCheckHookAndExtractSecret(ctx http.Context) (interface{}, error) {
 	if servicesCommon.FakeSecret && srv.devMode {
 		ctx.SetVariable("GithubSecret", "taubyte_secret")
+		return nil, nil
+	}
+	if isPing(ctx) {
 		return nil, nil
 	}
 	hook_uuid, err := ctx.GetStringVariable("hook")
@@ -47,7 +55,16 @@ func (srv *PatrickService) githubCheckHookAndExtractSecret(ctx http.Context) (in
 	return nil, nil
 }
 
+// isPing is GitHub's test delivery, sent when a hook is created. It carries no
+// push, so it is answered without the hook's secret and builds nothing.
+func isPing(ctx http.Context) bool {
+	return ctx.Request().Header.Get("X-GitHub-Event") == "ping"
+}
+
 func (srv *PatrickService) githubHookHandler(ctx http.Context) (interface{}, error) {
+	if isPing(ctx) {
+		return map[string]string{"ping": "pong"}, nil
+	}
 	newJob := &iface.Job{
 		Status:    iface.JobStatusOpen,
 		Timestamp: time.Now().Unix(),
@@ -67,7 +84,20 @@ func (srv *PatrickService) githubHookHandler(ctx http.Context) (interface{}, err
 		}
 	}
 
-	hook, err := github.New(github.Options.Secret(secret))
+	// Dream's inject signs only SHA-1 with the fake secret: keep the library's check for it.
+	parseSecret := ""
+	if servicesCommon.FakeSecret && srv.devMode {
+		parseSecret = secret
+	} else {
+		if secret == "" && !srv.devMode {
+			return nil, platformerr.New(platformerr.Rejected, errors.New("hook has no secret"))
+		}
+		if secret != "" && !validSignature256(ctx.Request().Header.Get("X-Hub-Signature-256"), ctx.Body(), secret) {
+			return nil, platformerr.New(platformerr.Rejected, errors.New("invalid X-Hub-Signature-256"))
+		}
+	}
+
+	hook, err := github.New(github.Options.Secret(parseSecret))
 	if err != nil {
 		return nil, fmt.Errorf("creating hook failed with %w", err)
 	}
@@ -87,10 +117,10 @@ func (srv *PatrickService) githubHookHandler(ctx http.Context) (interface{}, err
 
 	switch payload.(type) {
 	case github.PushPayload:
-		logger.Debugf("Hook triggred. Push: %v", payload)
+		logger.Debugf("Hook triggered: push")
 		pl, err := json.Marshal(payload)
 		if err != nil {
-			logger.Errorf("new pipeline for payload `%#v` failed with: %s", payload, err.Error())
+			logger.Errorf("encoding push payload failed with: %s", err.Error())
 			return nil, errors.New("can't decode push payload")
 		}
 
@@ -110,8 +140,13 @@ func (srv *PatrickService) githubHookHandler(ctx http.Context) (interface{}, err
 
 		newJob.Id = iface.PushEventJobID(&newJob.Meta)
 
-		if existing, err := srv.getJob(ctx.Request().Context(), "/jobs/", newJob.Id); err == nil && existing != nil {
+		// a redelivered push, even of a finished job, returns that job and runs nothing
+		if existing, err := srv.anyJob(ctx.Request().Context(), newJob.Id); err == nil && existing != nil {
 			return existing, nil
+		}
+
+		if !srv.devMode && time.Since(time.Unix(newJob.Meta.Repository.PushedAt, 0)) > maxPushAge {
+			return nil, fmt.Errorf("push is older than %s; use retry to rebuild it", maxPushAge)
 		}
 
 		// Pushing useful information to tns (ssh key stores effective URI for backward compat)
@@ -130,12 +165,30 @@ func (srv *PatrickService) githubHookHandler(ctx http.Context) (interface{}, err
 			return nil, fmt.Errorf("failed registering job with error: %w", err)
 		}
 
-		logger.Debugf("Got job: %#v", newJob)
+		logger.Debugf("Got job: %s", newJob.Id)
 
 		return newJob, nil
 	default:
 		return nil, fmt.Errorf("this is not a push event. but a %T", payload)
 	}
+}
+
+// maxPushAge refuses a signed push whose job is no longer stored (a replay).
+var maxPushAge = 24 * time.Hour
+
+// validSignature256 checks GitHub's "sha256=<hex hmac>" header over the raw body.
+func validSignature256(header string, body []byte, secret string) bool {
+	sig, ok := strings.CutPrefix(header, "sha256=")
+	if !ok {
+		return false
+	}
+	got, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hmac.Equal(got, mac.Sum(nil))
 }
 
 func (srv *PatrickService) RegisterJob(ctx context.Context, newJob *iface.Job) error {
@@ -154,9 +207,12 @@ func (srv *PatrickService) RegisterJob(ctx context.Context, newJob *iface.Job) e
 		return fmt.Errorf("failed putting job into database with error: %w", err)
 	}
 
-	err = srv.connectToProject(ctx, newJob)
-	if err != nil {
-		return err
+	if err = srv.connectToProject(ctx, newJob); err != nil {
+		if !errors.Is(err, errProjectUnknown) {
+			return err
+		}
+		// queued by the leader's re-announce once the config job publishes the repository
+		return srv.db.Put(ctx, waitingProjectPrefix+newJob.Id, []byte(strconv.FormatInt(time.Now().Unix(), 10)))
 	}
 
 	exists, err := srv.jobExistsInOtherCluster(ctx, newJob.Id)

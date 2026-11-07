@@ -7,7 +7,9 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/pbnjay/memory"
 	ci "github.com/taubyte/tau/pkg/containers"
+	"github.com/taubyte/tau/pkg/containers/core"
 	"github.com/taubyte/tau/pkg/specs/builders"
 )
 
@@ -34,9 +36,35 @@ func (b *builder) restrictEgress() bool {
 	return !b.dev && runtime.GOOS == "linux"
 }
 
-// devReusePulled is how long a development node builds with an image it pulled
-// before asking the registry again; it saves a registry round trip per build.
-const devReusePulled = 6 * time.Hour
+// buildLimits caps a confined build so one build.sh cannot starve the node or
+// its other tenants: buildMemory, no swap beyond it, 4096 processes, half the
+// cores.
+func buildLimits() core.ResourceLimits {
+	const period = 100_000
+	mem := buildMemory(memory.TotalMemory())
+	return core.ResourceLimits{
+		Memory:     mem,
+		MemorySwap: mem,
+		PIDs:       4096,
+		CPUPeriod:  period,
+		CPUQuota:   int64(max(runtime.NumCPU()/2, 1)) * period,
+	}
+}
+
+// How long a node builds with an image it pulled before asking the registry
+// again: each check is a registry round trip, and anonymous Docker Hub pulls
+// are rate limited. A new tag is a new name, so it is always pulled.
+const (
+	devReusePulled = 6 * time.Hour
+	reusePulled    = time.Hour
+)
+
+func (b *builder) reusePulled() time.Duration {
+	if b.dev {
+		return devReusePulled
+	}
+	return reusePulled
+}
 
 // devCaches are the package-manager and compiler caches a development node
 // keeps in named volumes shared by every build, so a build only downloads and
@@ -63,4 +91,15 @@ type output struct {
 
 type logs struct {
 	*os.File
+}
+
+// buildMemory is a build's memory limit: 4 GiB, but on a small node at most its
+// memory less 1 GiB, so the build is killed before tau and Docker are. Never
+// under 512 MiB; an unknown total gets the 4 GiB default.
+func buildMemory(total uint64) int64 {
+	const limit, reserve, floor = 4 << 30, 1 << 30, 512 << 20
+	if total == 0 || total >= limit+reserve {
+		return limit
+	}
+	return max(int64(total)-reserve, floor)
 }

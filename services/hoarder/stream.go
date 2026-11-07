@@ -169,7 +169,7 @@ func (srv *Service) stashReady(context.Context, streams.Connection, command.Body
 
 // stashReceive is the raw phase: read the framed header, import the streamed
 // bytes, verify the CID matches what the sender declared (reject on mismatch,
-// nothing kept), record the stash placement + this node's claim, fan out to
+// nothing recorded), record the stash placement + this node's claim, fan out to
 // co-claimants, then ack with the imported CID.
 func (srv *Service) stashReceive(ctx context.Context, rw io.ReadWriter) {
 	header, err := command.Decode(nil, rw)
@@ -184,6 +184,10 @@ func (srv *Service) stashReceive(ctx context.Context, rw io.ReadWriter) {
 	}
 	target, _ := maps.Int(header.Body, hoarderSpecs.BodyTarget)
 	owner := maps.TryString(header.Body, hoarderSpecs.BodyOwner)
+	if owner == "" {
+		// Senders still ask for the stash default; unowned bytes go everywhere.
+		target = stashTargetFor("", srv.fleetSize())
+	}
 	fanout, _ := maps.Bool(header.Body, hoarderSpecs.BodyFanout)
 
 	gotCid, err := srv.node.AddFileForCid(rw)
@@ -192,8 +196,8 @@ func (srv *Service) stashReceive(ctx context.Context, rw io.ReadWriter) {
 		return
 	}
 	if gotCid.String() != cidStr {
-		// The bytes hash to something other than declared — do not keep them.
-		srv.node.DeleteFile(gotCid.String()) //nolint:errcheck
+		// Reject without deleting: the blocks it hashes to may be another
+		// owner's, already stashed here.
 		stashErr(rw, fmt.Sprintf("cid mismatch: declared %s, imported %s", cidStr, gotCid.String()))
 		return
 	}
@@ -220,28 +224,44 @@ func stashErr(rw io.Writer, msg string) {
 	_ = cr.Response{"error": msg}.Encode(rw)
 }
 
-// fanoutStash re-pushes freshly-stashed bytes from this node to up to target-1
-// co-claimants (survivor-pushes-bytes). Re-pushes carry Fanout=false so the
-// receivers don't fan out again.
+// fanoutStash re-pushes freshly-stashed bytes from this node to members that do
+// not hold them yet, until target nodes do (survivor-pushes-bytes). Re-pushes
+// carry Fanout=false so the receivers don't fan out again.
 func (srv *Service) fanoutStash(ctx context.Context, cid string, target int, owner string) {
-	need := target - 1
-	if need <= 0 || srv.stashClient == nil {
+	if srv.stashClient == nil {
+		return
+	}
+	self := srv.node.ID().String()
+
+	// Members that already claim the bytes are skipped: re-sending them a whole
+	// file is wasted traffic, and with more than target members it could repeat
+	// on every reconcile without ever reaching the target.
+	held := map[string]bool{self: true}
+	if claims, err := srv.listStashClaims(ctx, cid); err == nil {
+		for _, pid := range srv.liveClaimants(claims) {
+			held[pid] = true
+		}
+	}
+	need := target - len(held)
+	if need <= 0 {
 		return
 	}
 
-	self := srv.node.ID().String()
-
 	pushed := 0
 	for _, pidStr := range srv.activeMembers() {
-		if pidStr == self {
+		if held[pidStr] {
 			continue
 		}
 		pid, err := peerCore.Decode(pidStr)
 		if err != nil {
 			continue
 		}
-		f, err := srv.node.GetFile(ctx, cid)
+		// Bounded like the asset sweep: a file whose blocks no reachable node
+		// holds (e.g. one damaged before an upgrade) must not stall the loop.
+		fctx, cancel := context.WithTimeout(ctx, hoarderSpecs.AssetSweepFetchTimeout)
+		f, err := srv.node.GetFile(fctx, cid)
 		if err != nil {
+			cancel()
 			logger.Errorf("stash fan-out: reading %s failed with: %s", cid, err)
 			continue
 		}
@@ -250,6 +270,7 @@ func (srv *Service) fanoutStash(ctx context.Context, cid string, target int, own
 			hoarderIface.WithOwner(owner),
 			hoarderIface.WithoutFanout())
 		f.Close()
+		cancel()
 		if err != nil {
 			logger.Errorf("stash fan-out to %s failed with: %s", pidStr, err)
 			continue

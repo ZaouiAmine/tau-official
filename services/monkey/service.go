@@ -34,13 +34,11 @@ func New(ctx context.Context, cfg tauConfig.Config) (*Service, error) {
 		srv.cluster = "main"
 	}
 
-	err = ci.Start(ctx, ci.Interval(ci.DefaultInterval), ci.MaxAge(ci.DefaultMaxAge))
+	err = ci.Start(ctx, ci.Interval(ci.DefaultInterval), ci.MaxAge(ci.DefaultMaxAge), ci.Keep(buildImages...))
 	if err != nil {
 		return nil, err
 	}
-	if srv.dev {
-		go warmBuildImages(ctx)
-	}
+	go warmBuildImages(ctx)
 
 	if srv.node = cfg.Node(); srv.node == nil {
 		srv.node, err = tauConfig.NewLiteNode(ctx, cfg, path.Join(cfg.Root(), protocolCommon.Monkey))
@@ -93,9 +91,15 @@ func (srv *Service) discoverPatrickPeers() []peer.ID {
 		if _, ok := seen[pid]; ok {
 			return
 		}
-		protos, err := srv.node.Peer().Peerstore().GetProtocols(pid)
-		if err != nil {
-			return
+		var protos []protocol.ID
+		if pid == srv.node.ID() {
+			// libp2p never lists a host own protocols in its peerstore
+			protos = srv.node.Peer().Mux().Protocols()
+		} else {
+			var err error
+			if protos, err = srv.node.Peer().Peerstore().GetProtocols(pid); err != nil {
+				return
+			}
 		}
 		hasRaft := slices.Contains(protos, raftProto)
 		hasPatrick := slices.Contains(protos, patrickProto)

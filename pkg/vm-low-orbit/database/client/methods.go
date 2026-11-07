@@ -2,9 +2,9 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
-	"github.com/ipfs/go-datastore"
 	"github.com/taubyte/go-sdk/errno"
 	common "github.com/taubyte/tau/core/vm"
 )
@@ -13,7 +13,7 @@ func (d *Database) Get(ctx context.Context, key string) (data []byte, err errno.
 	var err0 error
 	data, err0 = d.KV().Get(ctx, key)
 	if err0 != nil {
-		if strings.Contains(err0.Error(), datastore.ErrNotFound.Error()) {
+		if strings.Contains(err0.Error(), keyNotFound) {
 			err = errno.ErrorDatabaseKeyNotFound
 		} else {
 			err = errno.ErrorDatabaseGetFailed
@@ -44,7 +44,7 @@ func (f *Factory) databaseGet(ctx context.Context, module common.Module,
 		return uint32(err)
 	}
 
-	return uint32(f.WriteBytes(module, dataPtr, data))
+	return uint32(f.WriteBytesFor(module, getKey(databaseId, key), dataPtr, data))
 }
 
 func (f *Factory) databaseGetSize(ctx context.Context, module common.Module,
@@ -68,7 +68,7 @@ func (f *Factory) databaseGetSize(ctx context.Context, module common.Module,
 		return uint32(err)
 	}
 
-	return uint32(f.WriteBytesSize(module, sizePtr, data))
+	return uint32(f.WriteBytesSizeFor(module, getKey(keystoreId, key), sizePtr, data))
 }
 
 func (f *Factory) databasePut(ctx context.Context, module common.Module,
@@ -156,7 +156,7 @@ func (f *Factory) databaseList(ctx context.Context, module common.Module,
 		return uint32(errno.ErrorDatabaseListFailed)
 	}
 
-	return uint32(f.WriteStringSlice(module, dataPtr, keys))
+	return uint32(f.WriteStringSliceFor(module, listKey(databaseId, _key), dataPtr, keys))
 }
 
 func (f *Factory) databaseListSize(ctx context.Context, module common.Module,
@@ -180,5 +180,14 @@ func (f *Factory) databaseListSize(ctx context.Context, module common.Module,
 		return uint32(errno.ErrorDatabaseListFailed)
 	}
 
-	return uint32(f.WriteStringSliceSize(module, sizePtr, keys))
+	return uint32(f.WriteStringSliceSizeFor(module, listKey(databaseId, _key), sizePtr, keys))
 }
+
+// Keys naming a value across its size and data steps; see helpers/sized.go.
+func getKey(id uint32, key string) string  { return fmt.Sprintf("database.get/%d/%s", id, key) }
+func listKey(id uint32, key string) string { return fmt.Sprintf("database.list/%d/%s", id, key) }
+
+// keyNotFound ends the error of a missing key from the local kvdb
+// (datastore.ErrNotFound) and from the hoarder client and the kvdb mock, whose
+// errors are only "key not found".
+const keyNotFound = "key not found"
