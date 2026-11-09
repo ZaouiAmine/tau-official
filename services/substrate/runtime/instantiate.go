@@ -10,6 +10,7 @@ import (
 
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/taubyte/tau/core/vm"
+	"github.com/taubyte/tau/pkg/config"
 	"github.com/taubyte/tau/pkg/platformerr"
 	plugins "github.com/taubyte/tau/pkg/vm-low-orbit"
 	vmContext "github.com/taubyte/tau/pkg/vm/context"
@@ -72,7 +73,13 @@ func (i *instance) Free() error {
 	}
 
 	i.pooled = true
-	i.parent.availableInstances <- i
+	i.unhold()
+	// never block a caller (it may hold a request lock) on a full pool
+	select {
+	case i.parent.availableInstances <- i:
+	default:
+		i.Close()
+	}
 	return nil
 }
 
@@ -120,7 +127,63 @@ func (i *instance) Ready() (Instance, error) {
 }
 
 func (i *instance) Close() error {
+	i.unhold()
 	return i.runtime.Close()
+}
+
+// hold takes the project slot of a pooled instance checked out for a request.
+func hold(inst Instance) error {
+	i, ok := inst.(*instance)
+	if !ok {
+		return nil
+	}
+	if err := i.parent.acquire(i.parent.serviceable.Project(), i.parent.config.Memory); err != nil {
+		return err
+	}
+	i.held.Store(true)
+	return nil
+}
+
+// unhold gives the slot back once, when the instance is pooled or closed.
+func (i *instance) unhold() {
+	if i.held.CompareAndSwap(true, false) {
+		release(i.parent.serviceable.Project(), i.parent.config.Memory)
+	}
+}
+
+// repool puts back a pooled instance that could not be checked out.
+func (f *Function) repool(inst Instance) {
+	select {
+	case f.availableInstances <- inst:
+	default:
+		inst.Close()
+	}
+}
+
+// checkout takes a pooled instance or creates one, holding a project slot for it.
+func (f *Function) checkout() (Instance, error) {
+	select {
+	case pooled := <-f.availableInstances:
+		if err := hold(pooled); err != nil {
+			f.repool(pooled)
+			return nil, err
+		}
+		return pooled, nil
+	default:
+	}
+
+	project, mem := f.serviceable.Project(), f.config.Memory
+	if err := f.acquire(project, mem); err != nil {
+		return nil, err
+	}
+	runtime, sdk, err := f.instantiate()
+	if err != nil {
+		release(project, mem)
+		return nil, err
+	}
+	inst := &instance{runtime: runtime, sdk: sdk, parent: f}
+	inst.held.Store(true)
+	return inst, nil
 }
 
 func (i *instance) Stdout() io.Reader {
@@ -150,8 +213,10 @@ func (f *Function) Instantiate(ctx context.Context) (Instance, error) { //} (run
 
 	select {
 	case <-f.ctx.Done():
+		instCh.leave()
 		return nil, fmt.Errorf("function context done with: %w", f.ctx.Err())
 	case <-ctx.Done():
+		instCh.leave()
 		return nil, fmt.Errorf("instance request not sent: %w", ctx.Err())
 	case instance := <-instCh.ch:
 		if instCh.err != nil {
@@ -183,29 +248,32 @@ func (f *Function) intanceManager() {
 }
 
 func (f *Function) processRequest(reqCh *instanceRequest) {
+	inst, err := f.checkout()
+	if err == nil {
+		reqCh.give(inst)
+		return
+	}
+
+	logger.Errorf("creating new instance failed with: %s", err.Error())
+	// we reached some sort of limit
+	// wait for an instance to be available
 	select {
-	case instance := <-f.availableInstances:
-		reqCh.ch <- instance
-	default:
-		// we need to instantiate a new instance
-		// hoever if that does not work we need to repush the request in a way that is it first in line
-		runtime, sdk, err := f.instantiate()
-		if err == nil {
-			reqCh.ch <- &instance{runtime: runtime, sdk: sdk, parent: f}
-		} else {
-			logger.Errorf("creating new instance failed with: %s", err.Error())
-			// we reached some sort of limit
-			// wait for an instance to be available
-			select {
-			case <-reqCh.ctx.Done():
-				reqCh.err = fmt.Errorf("instance request context done with: %w", reqCh.ctx.Err())
-				reqCh.ch <- nil
-			case instance := <-f.availableInstances:
-				reqCh.ch <- instance
-			case <-f.ctx.Done():
-				return
-			}
+	case <-reqCh.ctx.Done():
+		reqCh.err = fmt.Errorf("instance request context done with: %w", reqCh.ctx.Err())
+		if platformerr.CodeOf(err) == platformerr.OverQuota {
+			reqCh.err = platformerr.New(platformerr.OverQuota, reqCh.err)
 		}
+		reqCh.give(nil)
+	case pooled := <-f.availableInstances:
+		if err := hold(pooled); err != nil {
+			f.repool(pooled)
+			reqCh.err = err
+			reqCh.give(nil)
+			return
+		}
+		reqCh.give(pooled)
+	case <-f.ctx.Done():
+		return
 	}
 }
 
@@ -292,6 +360,15 @@ func (f *Function) instantiate() (rt vm.Runtime, sdk plugins.Instance, err error
 	}
 
 	return
+}
+
+// acquire reserves the project's share for one more instance; services without caps are unlimited.
+func (f *Function) acquire(project string, mem uint64) error {
+	m, ok := f.serviceable.Service().(interface{ Caps(string) config.Caps })
+	if !ok {
+		return acquire(project, mem, config.Caps{})
+	}
+	return acquire(project, mem, m.Caps(project))
 }
 
 func (f *Function) configureVM() error {
