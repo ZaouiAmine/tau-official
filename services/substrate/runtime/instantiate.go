@@ -40,6 +40,10 @@ func (i *instance) usedMemory() (uint32, error) {
 // the cap never pool — with no room to grow, reuse only defers a mid-call OOM
 // trap, so cold-starting every call is the correct behavior for such
 // under-provisioned functions.
+// wasm memory never shrinks, so cap what a function's idle pool may hold
+// instead of letting 64 slots each grow to the function's memory cap.
+const poolMemBudget = 256 << 20
+
 func shouldRetire(useMem uint32, capBytes uint64) bool {
 	return uint64(useMem) > capBytes*2/3
 }
@@ -72,14 +76,14 @@ func (i *instance) Free() error {
 		return nil
 	}
 
+	if i.parent.pooledMem.Load()+int64(useMem) > poolMemBudget {
+		i.Close()
+		return nil
+	}
+
 	i.pooled = true
 	i.unhold()
-	// never block a caller (it may hold a request lock) on a full pool
-	select {
-	case i.parent.availableInstances <- i:
-	default:
-		i.Close()
-	}
+	i.parent.repool(i, useMem)
 	return nil
 }
 
@@ -131,6 +135,18 @@ func (i *instance) Close() error {
 	return i.runtime.Close()
 }
 
+// unpool takes a pooled instance's memory off its function's pool budget.
+func unpool(inst Instance) uint32 {
+	i, ok := inst.(*instance)
+	if !ok {
+		return 0
+	}
+	mem := i.poolMem
+	i.poolMem = 0
+	i.parent.pooledMem.Add(-int64(mem))
+	return mem
+}
+
 // hold takes the project slot of a pooled instance checked out for a request.
 func hold(inst Instance) error {
 	i, ok := inst.(*instance)
@@ -152,10 +168,17 @@ func (i *instance) unhold() {
 }
 
 // repool puts back a pooled instance that could not be checked out.
-func (f *Function) repool(inst Instance) {
+// mem is the instance's memory, counted against poolMemBudget while pooled.
+// It never blocks a caller (it may hold a request lock) on a full pool.
+func (f *Function) repool(inst Instance, mem uint32) {
+	if i, ok := inst.(*instance); ok {
+		i.poolMem = mem
+		f.pooledMem.Add(int64(mem))
+	}
 	select {
 	case f.availableInstances <- inst:
 	default:
+		f.pooledMem.Add(-int64(mem))
 		inst.Close()
 	}
 }
@@ -164,8 +187,9 @@ func (f *Function) repool(inst Instance) {
 func (f *Function) checkout() (Instance, error) {
 	select {
 	case pooled := <-f.availableInstances:
+		mem := unpool(pooled)
 		if err := hold(pooled); err != nil {
-			f.repool(pooled)
+			f.repool(pooled, mem)
 			return nil, err
 		}
 		return pooled, nil
@@ -265,8 +289,9 @@ func (f *Function) processRequest(reqCh *instanceRequest) {
 		}
 		reqCh.give(nil)
 	case pooled := <-f.availableInstances:
+		mem := unpool(pooled)
 		if err := hold(pooled); err != nil {
-			f.repool(pooled)
+			f.repool(pooled, mem)
 			reqCh.err = err
 			reqCh.give(nil)
 			return
