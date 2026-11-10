@@ -3,6 +3,7 @@ package tns
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -26,14 +27,12 @@ func (c *cache) close() {
 	c.lock.Unlock()
 }
 
-func (c *cache) put(key tns.Path, value interface{}) {
-
-	_, err := c.listen(key)
-	if err != nil {
-		logger.Error(err)
+// store caches value unless the key's topic was invalidated since gen was
+// read: a fetch that raced a push must not be kept as current.
+func (c *cache) store(sub *subscription, gen uint64, key tns.Path, value interface{}) {
+	if sub.gen.Load() != gen || sub.ctx.Err() != nil {
 		return
 	}
-
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if c.data != nil {
@@ -41,7 +40,14 @@ func (c *cache) put(key tns.Path, value interface{}) {
 	}
 }
 
-func (c *cache) listen(key tns.Path) (*subscription, error) {
+// initialLifetime spreads the first expiry so keys cached together do not all miss at once.
+func initialLifetime() time.Duration {
+	return common.ClientKeyCacheLifetime + rand.N(common.ClientKeyCacheLifetime/5+1)
+}
+
+// listen subscribes to the key's invalidations before it is fetched, and
+// returns the subscription's generation at that moment for store.
+func (c *cache) listen(key tns.Path) (*subscription, uint64, error) {
 	topic := common.GetChannelFor(key.Slice()...)
 
 	var (
@@ -56,8 +62,9 @@ func (c *cache) listen(key tns.Path) (*subscription, error) {
 	c.lock.RUnlock()
 
 	if ok {
-		sub.key <- key.String()
-		return sub, nil
+		gen := sub.gen.Load()
+		sub.send(key.String())
+		return sub, gen, nil
 	}
 
 	sub = &subscription{
@@ -65,20 +72,24 @@ func (c *cache) listen(key tns.Path) (*subscription, error) {
 		topic:    topic,
 		key:      make(chan string, 8),
 		keys:     make([]string, 0),
-		deadline: time.Now().Add(common.ClientKeyCacheLifetime),
+		deadline: time.Now().Add(initialLifetime()),
 	}
 	sub.ctx, sub.ctxC = context.WithCancel(c.node.Context())
 
 	err := c.node.PubSubSubscribeContext(sub.ctx, topic, func(msg *pubsub.Message) {
 		// TODO: implement tns Publish and optimize this
-		sub.deadline = sub.deadline.Add(common.ClientKeyCacheLifetime)
-		sub.key <- "" // TODO: do better later but for now "" mean drop all the keys
+		sub.gen.Add(1)
+		sub.send("") // "" means drop all the keys
 	}, func(err error) {
 		sub.ctxC()
 	})
 	if err != nil {
-		return sub, fmt.Errorf("subscription to key `%s`||`%s` failed to initialize with: %s", key.String(), topic, err.Error())
+		return sub, 0, fmt.Errorf("subscription to key `%s`||`%s` failed to initialize with: %s", key.String(), topic, err.Error())
 	}
+
+	// Before anything can fill the queue: a full queue with no reader hangs
+	// this request and every later one for the key.
+	sub.watch()
 
 	c.lock.Lock()
 	if c.subscriptions != nil {
@@ -86,13 +97,22 @@ func (c *cache) listen(key tns.Path) (*subscription, error) {
 	}
 	c.lock.Unlock()
 
-	sub.key <- key.String()
+	gen := sub.gen.Load()
+	sub.send(key.String())
 
-	sub.watch()
-
-	return sub, nil
+	return sub, gen, nil
 }
 
+// send hands a key to the watch loop, or drops it once the subscription is
+// closed: the channel is never closed, so a late sender cannot panic.
+func (sub *subscription) send(k string) {
+	select {
+	case sub.key <- k:
+	case <-sub.ctx.Done():
+	}
+}
+
+// watch owns keys and deadline after creation, so neither needs a lock.
 func (sub *subscription) watch() {
 	go func() {
 		for {
@@ -102,6 +122,7 @@ func (sub *subscription) watch() {
 				return
 			case k := <-sub.key:
 				if k == "" {
+					sub.deadline = sub.deadline.Add(common.ClientKeyCacheLifetime)
 					for _, k := range sub.keys {
 						sub.cache.lock.Lock()
 						if sub.cache.data != nil {
@@ -126,7 +147,7 @@ func (sub *subscription) watch() {
 func (sub *subscription) close() {
 	sub.ctxC()
 	sub.cache.lock.Lock()
-	if sub.cache.subscriptions != nil {
+	if sub.cache.subscriptions != nil && sub.cache.subscriptions[sub.topic] == sub {
 		delete(sub.cache.subscriptions, sub.topic)
 	}
 	if sub.cache.data != nil {
@@ -134,7 +155,6 @@ func (sub *subscription) close() {
 			delete(sub.cache.data, k)
 		}
 	}
-	close(sub.key)
 	sub.keys = nil
 	sub.cache.lock.Unlock()
 }

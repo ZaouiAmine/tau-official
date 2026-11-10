@@ -70,6 +70,10 @@ func (s *Starfish) IsAssigned(jid string) (bool, error) {
 	return job.Status == patrick.JobStatusLocked, nil
 }
 
+func (s *Starfish) Refresh(jid string) (bool, error) {
+	return s.IsAssigned(jid)
+}
+
 func (s *Starfish) Done(jid string, cid_log map[string]string, assetCid map[string]string) error {
 	job := s.Jobs[jid]
 	if job != nil {
@@ -79,7 +83,7 @@ func (s *Starfish) Done(jid string, cid_log map[string]string, assetCid map[stri
 	return nil
 }
 
-func (s *Starfish) Failed(jid string, cid_log map[string]string, assetCid map[string]string) error {
+func (s *Starfish) Failed(jid string, cid_log map[string]string, assetCid map[string]string, reason string) error {
 	job, ok := s.Jobs[jid]
 	if !ok {
 		return fmt.Errorf("can't find job %s", jid)

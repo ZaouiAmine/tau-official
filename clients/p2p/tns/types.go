@@ -3,6 +3,7 @@ package tns
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/taubyte/tau/core/services/tns"
@@ -10,6 +11,7 @@ import (
 	client "github.com/taubyte/tau/p2p/streams/client"
 
 	peerCore "github.com/libp2p/go-libp2p/core/peer"
+	"golang.org/x/sync/singleflight"
 )
 
 type Client struct {
@@ -17,6 +19,7 @@ type Client struct {
 	client *client.Client
 	peers  []peerCore.ID
 	cache  *cache
+	flight singleflight.Group
 }
 
 type Stats Client
@@ -29,6 +32,8 @@ type subscription struct {
 	key      chan string
 	keys     []string
 	deadline time.Time
+	// gen counts invalidations, so a fetch started before one is not cached.
+	gen atomic.Uint64
 }
 
 type cache struct {

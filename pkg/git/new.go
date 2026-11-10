@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -65,6 +66,9 @@ func New(ctx context.Context, options ...Option) (c *Repository, err error) {
 		if err != nil {
 			return
 		}
+		if c.reuse {
+			err = c.pin()
+		}
 	}
 
 	return
@@ -88,6 +92,21 @@ func (c *Repository) open_or_clone() error {
 	}
 
 	c.repo, err = git.PlainOpen(c.root)
+	if c.reuse && c.usingSpecificBranch {
+		if err == nil {
+			if err = c.refresh(); err == nil {
+				return nil
+			}
+		}
+		// shortcut: any refresh failure re-clones, even a transient one.
+		if err = os.RemoveAll(c.root); err != nil {
+			return err
+		}
+		if err = os.MkdirAll(c.root, 0755); err != nil {
+			return err
+		}
+		return c.clone()
+	}
 	if err != nil {
 		return c.clone()
 	}
@@ -102,6 +121,27 @@ func (c *Repository) open_or_clone() error {
 
 func (c *Repository) clone() (err error) {
 	Info("Cloning from " + c.url + " on branch " + c.branches[0] + " into " + c.root + "\n")
+
+	if c.shallow && c.usingSpecificBranch && !c.embedToken {
+		c.repo, err = git.PlainCloneContext(c.ctx, c.root, false, &git.CloneOptions{
+			URL:           c.url,
+			Progress:      c.output,
+			Auth:          c.auth,
+			Depth:         1,
+			SingleBranch:  true,
+			ReferenceName: plumbing.NewBranchReferenceName(c.branches[0]),
+		})
+		if err == nil {
+			pterm.Success.Printf("Cloning %s complete\n", c.url)
+			c.i_cloned_it = true
+			return nil
+		}
+		// Anything a full clone handles differently (a missing branch, an
+		// empty repository, a public one over https) is left to it.
+		if err = os.RemoveAll(filepath.Join(c.root, ".git")); err != nil {
+			return err
+		}
+	}
 
 	if c.embedToken {
 		var cloneURL string

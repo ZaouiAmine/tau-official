@@ -6,7 +6,9 @@ import (
 
 	wazy "github.com/samyfodil/wazy"
 	"github.com/taubyte/tau/core/services/substrate/components"
+	"github.com/taubyte/tau/core/services/tns"
 	"github.com/taubyte/tau/core/vm"
+	"github.com/taubyte/tau/pkg/config"
 	structureSpec "github.com/taubyte/tau/pkg/specs/structure"
 	plugins "github.com/taubyte/tau/pkg/vm-low-orbit"
 )
@@ -72,6 +74,7 @@ func (*mockServiceable) AssetId() string {
 }
 
 func (*mockService) Verbose() bool           { return false }
+func (*mockService) Tns() tns.Client         { return nil }
 func (m *mockService) Vm() vm.Service        { return m.vm }
 func (*mockService) Orbitals() []vm.Plugin   { return nil }
 func (*mockService) Cache() components.Cache { return &mockCache{} }
@@ -98,3 +101,5 @@ func (*mockRuntime) Close() error  { return nil }
 func (*mockRuntime) Attach(plugin vm.Plugin) (vm.PluginInstance, vm.ModuleInstance, error) {
 	return nil, nil, nil
 }
+
+func (*mockService) Caps(string) config.Caps { return config.Caps{} }

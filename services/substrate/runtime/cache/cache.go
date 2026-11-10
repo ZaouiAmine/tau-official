@@ -122,7 +122,9 @@ func (c *Cache) validate(serviceable iface.Serviceable, branches []string) error
 	projectId := serviceable.Project()
 	commit, _, err := tnsClient.Simple().Commit(projectId, branches...)
 	if err != nil {
-		return fmt.Errorf("getting serviceable `%s` commit failed with: %w", serviceable.Id(), err)
+		// A failed check says nothing about the function: closing it killed
+		// in-flight requests whenever TNS was briefly unreachable.
+		return nil
 	}
 
 	if serviceable.Commit() != commit {
@@ -133,6 +135,13 @@ func (c *Cache) validate(serviceable iface.Serviceable, branches []string) error
 	assetId, err := ResolveAssetCid(serviceable)
 	if err == nil && serviceable.AssetId() != assetId {
 		return fmt.Errorf("cached pick assetId `%s` is outdated, latest assetId is `%s`", serviceable.AssetId(), assetId)
+	}
+
+	// a library push changes the modules a function loaded without touching its commit or asset
+	if fn, ok := serviceable.(interface{ ModulesChanged() error }); ok {
+		if err := fn.ModulesChanged(); err != nil {
+			return fmt.Errorf("cached pick is outdated: %w", err)
+		}
 	}
 
 	return nil

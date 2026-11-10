@@ -8,8 +8,10 @@ import (
 type Client interface {
 	Dequeue() (*Job, error)
 	IsAssigned(jid string) (bool, error)
+	Refresh(jid string) (bool, error)
 	Done(jid string, cid_log map[string]string, assetCid map[string]string) error
-	Failed(jid string, cid_log map[string]string, assetCid map[string]string) error
+	// Failed reports a failed run. A non-empty reason means another run would fail the same way, so the job is not retried.
+	Failed(jid string, cid_log map[string]string, assetCid map[string]string, reason string) error
 	List() ([]string, error)
 	Get(jid string) (*Job, error)
 	Timeout(jid string) error

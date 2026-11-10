@@ -27,7 +27,7 @@ import (
 var (
 	BootstrapTime            = 10 * time.Second
 	logger                   = log.Logger("tau.patrick.service")
-	DefaultReAnnounceJobTime = 1 * time.Minute
+	DefaultReAnnounceJobTime = 5 * time.Second
 	MaxReAnnounceJobs        = 10
 )
 
@@ -42,9 +42,6 @@ func New(ctx context.Context, cfg tauConfig.Config) (*PatrickService, error) {
 	var err error
 	srv.devMode = cfg.DevMode()
 	srv.reAnnounceJobTime = DefaultReAnnounceJobTime
-	if srv.devMode {
-		srv.reAnnounceJobTime = 5 * time.Second
-	}
 	srv.cluster = cfg.Cluster()
 	if cfg.RaftCluster() == nil {
 		return nil, fmt.Errorf("raft cluster is required")
@@ -101,6 +98,16 @@ func New(ctx context.Context, cfg tauConfig.Config) (*PatrickService, error) {
 		defer srv.http.Start()
 	}
 
+	if err = srv.startLiveLogs(srv.ctx); err != nil {
+		return nil, fmt.Errorf("subscribing to live logs failed with: %w", err)
+	}
+
+	go func() {
+		if err := srv.backfillLogOwners(srv.ctx); err != nil && srv.ctx.Err() == nil {
+			logger.Errorf("recording the owners of older logs failed: %s", err)
+		}
+	}()
+
 	srv.setupHTTPRoutes()
 
 	// Go routine to re announce any pending jobs (queue-based or pubsub-based)
@@ -110,6 +117,10 @@ func New(ctx context.Context, cfg tauConfig.Config) (*PatrickService, error) {
 			case <-ctx.Done():
 				return
 			case <-time.After(srv.reAnnounceJobTime):
+				// only the leader can write the queue; a follower's enqueue does nothing
+				if !srv.raftCluster.IsLeader() {
+					continue
+				}
 				_ctx, cancel := context.WithTimeout(ctx, srv.reAnnounceJobTime)
 				err := srv.ReannounceJobs(_ctx)
 				if err != nil {

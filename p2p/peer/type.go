@@ -33,7 +33,6 @@ type Node interface {
 	Close()
 	Context() context.Context
 	DAG() *DAGService
-	DeleteFile(id string) error
 	Discovery() discovery.Discovery
 	Done() <-chan struct{}
 	GetFile(ctx context.Context, id string) (ReadSeekCloser, error)
@@ -73,6 +72,7 @@ type node struct {
 
 	topicsMutex sync.RWMutex
 	topics      map[string]*pubsub.Topic
+	topicRefs   map[string]int
 	closed      atomic.Bool
 }
 

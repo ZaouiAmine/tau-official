@@ -2,12 +2,17 @@ package http
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	goHttp "net/http"
 
+	"github.com/ipfs/go-log/v2"
 	iface "github.com/taubyte/tau/core/services/substrate/components/http"
+	httptun "github.com/taubyte/tau/p2p/streams/tunnels/http"
 	http "github.com/taubyte/tau/pkg/http"
+	"github.com/taubyte/tau/pkg/platformerr"
+	protocolCommon "github.com/taubyte/tau/services/common"
 	"github.com/taubyte/tau/services/substrate/components/http/common"
 	"github.com/taubyte/tau/services/substrate/runtime/counter"
 	"github.com/taubyte/tau/services/substrate/runtime/helpers"
@@ -15,6 +20,8 @@ import (
 )
 
 func (s *Service) Lookup(matcher *common.MatchDefinition) (iface.Serviceable, error) {
+	defer trackLookup()()
+
 	servs, err := lookup.Lookup(s, matcher)
 	if err != nil {
 		return nil, fmt.Errorf("http serviceable lookup failed with: %w", err)
@@ -42,37 +49,64 @@ func (s *Service) Lookup(matcher *common.MatchDefinition) (iface.Serviceable, er
 }
 
 func (s *Service) handle(w goHttp.ResponseWriter, r *goHttp.Request) error {
+	_, err := s.ServeLocal(w, r)
+	return err
+}
+
+// ServeLocal serves r on this node. handled is false when nothing ran and
+// nothing was written, because this node has no match or is full, so a gateway
+// in this process may still send the request to another node.
+func (s *Service) ServeLocal(w goHttp.ResponseWriter, r *goHttp.Request) (handled bool, err error) {
 	startTime := time.Now()
 	matcher := common.New(helpers.ExtractHost(r.Host), r.URL.Path, r.Method)
 
 	pick, err := s.Lookup(matcher)
 	if err != nil {
-		return fmt.Errorf("looking up serviceable failed with: %w", err)
+		return false, fmt.Errorf("looking up serviceable failed with: %w", err)
 	}
 
-	if !pick.IsProvisioned() {
-		pick, err = pick.Provision()
-		if err != nil {
-			return fmt.Errorf("provisioning serviceable failed with: %w", err)
+	run := func() error {
+		if !pick.IsProvisioned() {
+			pick, err = pick.Provision()
+			if err != nil {
+				return fmt.Errorf("provisioning serviceable failed with: %w", err)
+			}
 		}
+
+		if err := pick.Ready(); err != nil {
+			return counter.ErrorWrapper(pick, startTime, time.Time{}, fmt.Errorf("HTTP serviceable is not ready with: %w", err))
+		}
+
+		coldStartDoneTime, err := pick.Handle(w, r, matcher)
+		return counter.ErrorWrapper(pick, startTime, coldStartDoneTime, err)
 	}
 
-	if err := pick.Ready(); err != nil {
-		return counter.ErrorWrapper(pick, startTime, time.Time{}, fmt.Errorf("HTTP serviceable is not ready with: %s", err))
+	// Websites answer from memory in microseconds, and a flood of slow
+	// functions must not turn the site away, so only functions take a slot.
+	if _, isSite := pick.(iface.Website); isSite {
+		return true, run()
 	}
-
-	coldStartDoneTime, err := pick.Handle(w, r, matcher)
-	return counter.ErrorWrapper(pick, startTime, coldStartDoneTime, err)
+	err = admitted(r.Context(), s.inflight, run)
+	if platformerr.CodeOf(err) == platformerr.NodeBusy {
+		// every NodeBusy is raised before the guest is called, so a gateway may try another node
+		httptun.Refuse(w)
+		return false, err
+	}
+	return true, err
 }
 
+var logger = log.Logger("tau.substrate.service.http")
+
 func (s *Service) Handler(w goHttp.ResponseWriter, r *goHttp.Request) {
-	if err := s.handle(w, r); err != nil {
-		w.WriteHeader(500)
-		w.Write([]byte(err.Error()))
-	}
+	platformerr.Serve(w, r, logger, s.handle)
 }
 
 func (s *Service) attach() error {
+	// A gateway on this node takes the catch-all and reaches this service over the tunnel.
+	if slices.Contains(s.config.Services(), protocolCommon.Gateway) {
+		return nil
+	}
+
 	s.Http().LowLevel(&http.LowLevelDefinition{
 		PathPrefix: "/",
 		Handler:    s.Handler,

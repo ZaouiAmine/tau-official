@@ -7,10 +7,11 @@ import (
 // convertToContainerConfig converts old Container options to ContainerConfig
 func convertToContainerConfig(imageName string, c *Container) *core.ContainerConfig {
 	config := &core.ContainerConfig{
-		Image:   imageName,
-		Command: c.cmd,
-		Env:     c.env,
-		WorkDir: c.workDir,
+		Image:     imageName,
+		Command:   c.cmd,
+		Env:       c.env,
+		WorkDir:   c.workDir,
+		Resources: c.resources,
 	}
 
 	if c.restrictedEgress {
@@ -26,8 +27,9 @@ func convertToContainerConfig(imageName string, c *Container) *core.ContainerCon
 		for i, vol := range c.volumes {
 			// Old API doesn't support read-only; it uses bind mounts (not volume names)
 			config.Volumes[i] = core.VolumeMount{
-				Source:      vol.source,
-				Destination: vol.target,
+				Source:       vol.source,
+				Destination:  vol.target,
+				IsVolumeName: vol.named,
 			}
 		}
 	}

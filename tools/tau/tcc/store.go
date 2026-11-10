@@ -25,7 +25,6 @@ type Store struct {
 func Open() (*Store, error) {
 	selected, err := config.GetSelectedProject()
 	if err != nil {
-		i18n.Help().BeSureToSelectProject()
 		return nil, err
 	}
 	cfg, err := config.Projects().Get(selected)
@@ -149,6 +148,22 @@ func (st *Store) Write(group, name string, doc Doc) error {
 		return err
 	}
 	return st.flush()
+}
+
+// Issues applies doc on a throwaway fork (the session itself writes through to
+// the repo) and returns what the DSL finds wrong with the resource: missing
+// required fields and invalid values.
+func (st *Store) Issues(group, name string, doc Doc) ([]schema.FieldIssue, error) {
+	fork, err := st.s.Fork()
+	if err != nil {
+		return nil, err
+	}
+	defer fork.Close()
+	res := st.res(group, name)
+	if err := fork.SetResource(res, doc); err != nil {
+		return nil, err
+	}
+	return fork.ValidateResource(res), nil
 }
 
 // Delete removes a resource. A container's instance is a directory, and the

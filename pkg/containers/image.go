@@ -2,16 +2,19 @@ package containers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/taubyte/tau/pkg/containers/core"
 )
 
 // Image initializes the given image. It tries to pull from the registry first to get the latest;
-// if pull fails and the image exists locally, that image is used. If the Build() Option is provided
-// then the given DockerFile tarball is built and returned.
+// if pull fails, a local copy is used only if this process pulled it before (or TrustLocal is set).
+// If the Build() Option is provided then the given DockerFile tarball is built, once, and returned.
 func (c *Client) Image(ctx context.Context, name string, options ...ImageOption) (image *DockerImage, err error) {
 	image = &DockerImage{
 		backend: c.backend,
@@ -26,21 +29,77 @@ func (c *Client) Image(ctx context.Context, name string, options ...ImageOption)
 		}
 	}
 
+	defer markUsed(name)
+
 	imageExists := image.checkImageExists(ctx)
-	if image.buildTarball != nil && (ForceRebuild || !imageExists) {
-		if err := image.buildImage(ctx); err != nil {
-			return nil, errorImageBuild(name, err)
+	if image.buildTarball != nil {
+		// The name carries the hash of the Dockerfile tarball it is built from,
+		// so a local image by that name is this build's own; no registry has it.
+		if ForceRebuild || !imageExists {
+			if err := image.buildImage(ctx); err != nil {
+				return nil, errorImageBuild(name, err)
+			}
+			locallyBuilt.Store(name, struct{}{})
 		}
+	} else if imageExists && pulledWithin(name, image.reusePulled) {
+		return image, nil
 	} else {
 		if _, err := image.Pull(ctx, nil); err != nil {
-			if imageExists {
+			// A local copy outlives a registry outage only if this node pulled or
+			// built it itself: any other local image may be another tenant's build.
+			_, pulled := lastPulled.Load(name)
+			_, built := locallyBuilt.Load(name)
+			if imageExists && (pulled || built || image.trustLocal) {
 				return image, nil
 			}
 			return nil, errorImagePull(name, err)
 		}
+		markPulled(name)
 	}
 
 	return
+}
+
+var (
+	// lastPulled and lastUsed are keyed by image name and hold a time.Time.
+	lastPulled sync.Map
+	// locallyBuilt holds the names this process built from a Dockerfile.
+	locallyBuilt sync.Map
+	lastUsed     sync.Map
+)
+
+func markPulled(name string) { lastPulled.Store(name, time.Now()) }
+func markUsed(name string)   { lastUsed.Store(name, time.Now()) }
+
+// pulledWithin reports whether this process pulled name less than age ago.
+func pulledWithin(name string, age time.Duration) bool {
+	if age <= 0 {
+		return false
+	}
+	at, ok := lastPulled.Load(name)
+	return ok && time.Since(at.(time.Time)) < age
+}
+
+// CleanUnused removes the images this process has used but not for idle or
+// longer, except those named in keep. Images it never used are left alone:
+// they are not tau's to remove.
+// An image a container still holds fails to remove and is tried again later.
+func (c *Client) CleanUnused(ctx context.Context, idle time.Duration, keep ...string) error {
+	var errs []error
+	lastUsed.Range(func(key, value any) bool {
+		name := key.(string)
+		if slices.Contains(keep, name) || time.Since(value.(time.Time)) < idle {
+			return true
+		}
+		if err := c.backend.Image(name).Remove(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("removing image %s: %w", name, err))
+			return true
+		}
+		lastUsed.Delete(name)
+		lastPulled.Delete(name)
+		return true
+	})
+	return errors.Join(errs...)
 }
 
 // checkImage checks the docker host client if the image is known.

@@ -222,6 +222,7 @@ func (m *mockHTTPContextWithComplexVars) GetIntVariable(key string) (int, error)
 type mockGitHubClient struct {
 	currentRepo *github.Repository
 	user        *github.User
+	removeOther func(name, keep string) // called by RemoveOtherDeployKeys, when set
 }
 
 func (m *mockGitHubClient) Cur() *github.Repository {
@@ -261,6 +262,13 @@ func (m *mockGitHubClient) CreateRepository(name *string, description *string, p
 	return nil
 }
 
+func (m *mockGitHubClient) RemoveOtherDeployKeys(name string, keep string) error {
+	if m.removeOther != nil {
+		m.removeOther(name, keep)
+	}
+	return nil
+}
+
 func (m *mockGitHubClient) CreateDeployKey(name *string, key *string) error {
 	return nil
 }
@@ -269,8 +277,12 @@ func (m *mockGitHubClient) CreatePushHook(name *string, url *string, devMode boo
 	return 0, "", nil
 }
 
-func (m *mockGitHubClient) ListMyRepos() map[string]RepositoryBasicInfo {
-	return make(map[string]RepositoryBasicInfo)
+func (m *mockGitHubClient) EachRepoPage(fn func(ids []string) bool) error { return nil }
+
+func (m *mockGitHubClient) RemoveDeployKey(key string) error { return nil }
+
+func (m *mockGitHubClient) ListMyRepos() (map[string]RepositoryBasicInfo, error) {
+	return make(map[string]RepositoryBasicInfo), nil
 }
 
 func (m *mockGitHubClient) ShortRepositoryInfo(id string) RepositoryShortInfo {

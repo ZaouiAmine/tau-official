@@ -3,9 +3,12 @@ package builder
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,8 +37,13 @@ func (b *builder) buildImage() (clientImage *ci.DockerImage, err error) {
 	image := environment.Image
 
 	// base options
-	ops := make([]ci.ImageOption, 0, 2)
+	ops := make([]ci.ImageOption, 0, 3)
 	ops = append(ops, ci.Output(b.output))
+	ops = append(ops, ci.ReusePulled(b.reusePulled()))
+	if b.dev {
+		// a laptop's own images, usable offline
+		ops = append(ops, ci.TrustLocal())
+	}
 
 	// if tarball is set then a new image is created
 	if b.tarball != nil {
@@ -64,13 +72,14 @@ func (b *builder) buildImage() (clientImage *ci.DockerImage, err error) {
 // run will initialize and run the container with the given image
 func (b *builder) run(output *output, image *ci.DockerImage, environment specs.Environment, ops ...ci.ContainerOption) (err error) {
 	json.NewEncoder(b.output).Encode(struct {
-		Op        string            `json:"op"`
-		Timestamp int64             `json:"timestamp"`
-		Env       map[string]string `json:"env"`
+		Op        string   `json:"op"`
+		Timestamp int64    `json:"timestamp"`
+		Env       []string `json:"env"`
 	}{
 		Op:        "run container",
 		Timestamp: time.Now().UnixNano(),
-		Env:       environment.Variables,
+		// names only: job logs are kept by CID and streamed, values may be secrets
+		Env: slices.Sorted(maps.Keys(environment.Variables)),
 	})
 
 	output.outDir, err = os.MkdirTemp("", "*")
@@ -88,14 +97,22 @@ func (b *builder) run(output *output, image *ci.DockerImage, environment specs.E
 			Timestamp: time.Now().UnixNano(),
 		})
 
-		ops = append(ops, b.wd.DefaultOptions(script, output.outDir, environment)...)
+		// Each step gets its own options: appending to ops itself carried every
+		// earlier step's mounts into the next, and a second step failed on a
+		// duplicate mount point.
+		stepOps := append(slices.Clip(ops), b.wd.DefaultOptions(script, output.outDir, environment)...)
 		if b.restrictEgress() {
 			// build.sh is untrusted repo content: confine its network to the
 			// public internet so it cannot reach node-local services or the
 			// cloud metadata endpoint.
-			ops = append(ops, ci.RestrictedEgress())
+			stepOps = append(stepOps, ci.RestrictedEgress(), ci.Resources(buildLimits()))
 		}
-		container, err := image.Instantiate(b.context, ops...)
+		if b.dev {
+			for volume, path := range devCaches {
+				stepOps = append(stepOps, ci.NamedVolume(volume, path))
+			}
+		}
+		container, err := image.Instantiate(b.context, stepOps...)
 		if err != nil {
 			json.NewEncoder(b.output).Encode(struct {
 				Step      string `json:"step"`
@@ -118,6 +135,11 @@ func (b *builder) run(output *output, image *ci.DockerImage, environment specs.E
 			}
 		}
 		if runErr != nil {
+			if errors.Is(runErr, ci.ErrorOutOfMemory) {
+				runErr = fmt.Errorf("%w: %w", b.outOfMemory(), runErr)
+			} else if errors.Is(runErr, ci.ErrorKilled) {
+				runErr = fmt.Errorf("the build was killed before it finished, for example by its node stopping or restarting; it was not confirmed as out of memory: %w", runErr)
+			}
 			json.NewEncoder(b.output).Encode(struct {
 				Step      string `json:"step"`
 				Timestamp int64  `json:"timestamp"`

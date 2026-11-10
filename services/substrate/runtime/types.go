@@ -29,6 +29,8 @@ type Function struct {
 	shutdown     *atomic.Bool
 	shutdownDone chan struct{}
 	shutdownMu   sync.RWMutex
+	// drained: Shutdown has emptied the pool, so returned instances are closed. Guarded by shutdownMu.
+	drained bool
 
 	// metrics
 	coldStarts     *atomic.Uint64
@@ -41,6 +43,15 @@ type Function struct {
 	// noPoolWarned gates the once-per-function warning emitted when instances
 	// retire without ever pooling (memory config leaves no headroom).
 	noPoolWarned atomic.Bool
+
+	// pooledMem is the wasm memory held by idle pooled instances.
+	pooledMem atomic.Int64
+
+	// modules maps each wasm module the function loaded (its own, a library
+	// it runs as, or one it imports) to the address it resolved to, so a
+	// library push can be noticed. nil until the first call has run.
+	modulesLock sync.Mutex
+	modules     map[string]string
 }
 
 type instance struct {
@@ -54,6 +65,13 @@ type instance struct {
 	// is in an unknown (possibly closed) state, so Free retires it instead of
 	// repooling.
 	failed bool
+
+	// poolMem is this instance's share of parent.pooledMem while pooled.
+	poolMem uint32
+
+	// held: the instance is checked out for a request and counts against its
+	// project's caps until it goes back to the pool or is closed.
+	held atomic.Bool
 
 	// pooled marks an instance that made it into the pool at least once,
 	// distinguishing normal growth-retirement from a config that never pools.
@@ -71,6 +89,37 @@ type instanceRequest struct {
 	ctx context.Context
 	ch  chan Instance
 	err error
+
+	// gone is set once the caller stopped waiting; an instance for it goes back to the pool.
+	mu   sync.Mutex
+	gone bool
+}
+
+// give hands inst to the caller, or back to the pool when the caller has left.
+func (r *instanceRequest) give(inst Instance) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.gone {
+		if inst != nil {
+			inst.Free()
+		}
+		return
+	}
+	r.ch <- inst
+}
+
+// leave marks the caller gone and returns an instance already handed over to the pool.
+func (r *instanceRequest) leave() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gone = true
+	select {
+	case inst := <-r.ch:
+		if inst != nil {
+			inst.Free()
+		}
+	default:
+	}
 }
 
 type Instance interface {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/taubyte/tau/p2p/keypair"
@@ -353,4 +354,43 @@ func TestACMECertificateErrorPaths(t *testing.T) {
 	// Verify cleanup happened
 	_, err = svc.db.Get(ctx, key)
 	assert.Assert(t, err != nil, "Expected certificate to be cleaned up")
+}
+
+func TestAcmeServiceHandlerDeleteCertificate(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, newTestConfig(t, 12391))
+	assert.NilError(t, err)
+	defer svc.Close()
+
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "set", "fqdn": "*.gen.example.com", "certificate": []byte("staging")})
+	assert.NilError(t, err)
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "delete", "fqdn": "*.gen.example.com"})
+	assert.NilError(t, err)
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "get", "fqdn": "*.gen.example.com"})
+	assert.ErrorContains(t, err, "cache miss")
+
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "delete", "fqdn": "missing.example.com"})
+	assert.NilError(t, err)
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "delete"})
+	assert.Assert(t, err != nil)
+}
+
+func TestAcmeServiceHandlerListCertificates(t *testing.T) {
+	ctx := context.Background()
+	svc, err := New(ctx, newTestConfig(t, 12392))
+	assert.NilError(t, err)
+	defer svc.Close()
+
+	for _, fqdn := range []string{"*.gen.example.com", "site.example.com"} {
+		_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "set", "fqdn": fqdn, "certificate": []byte("pem")})
+		assert.NilError(t, err)
+	}
+	_, err = svc.acmeServiceHandler(ctx, nil, command.Body{"action": "cache-set", "key": "acme_account+key", "data": []byte("k")})
+	assert.NilError(t, err)
+
+	resp, err := svc.acmeServiceHandler(ctx, nil, command.Body{"action": "list"})
+	assert.NilError(t, err)
+	names := resp["names"].([]string)
+	sort.Strings(names)
+	assert.DeepEqual(t, names, []string{"*.gen.example.com", "site.example.com"})
 }

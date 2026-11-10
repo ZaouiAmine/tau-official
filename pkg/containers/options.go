@@ -3,7 +3,9 @@ package containers
 import (
 	"bytes"
 	"io"
+	"time"
 
+	"github.com/taubyte/tau/pkg/containers/core"
 	"github.com/taubyte/tau/utils/bundle"
 )
 
@@ -37,6 +39,25 @@ func Dockerfile(dockerfile string) ImageOption {
 func Output(output io.Writer) ImageOption {
 	return func(i *DockerImage) error {
 		i.output = output
+		return nil
+	}
+}
+
+// ReusePulled uses a local copy this process pulled less than age ago as is,
+// instead of asking the registry for a newer one every time.
+func ReusePulled(age time.Duration) ImageOption {
+	return func(i *DockerImage) error {
+		i.reusePulled = age
+		return nil
+	}
+}
+
+// TrustLocal lets a failed pull fall back to any local image by that name, not
+// only one this process pulled. For a single-tenant node, where every local
+// image is its owner's.
+func TrustLocal() ImageOption {
+	return func(i *DockerImage) error {
+		i.trustLocal = true
 		return nil
 	}
 }
@@ -96,6 +117,14 @@ func RestrictedBuildEgress() ImageOption {
 	}
 }
 
+// Resources caps the container's memory, CPU and processes.
+func Resources(limits core.ResourceLimits) ContainerOption {
+	return func(c *Container) error {
+		c.resources = &limits
+		return nil
+	}
+}
+
 // Variable sets an environment variable in the container.
 func Variable(key, value string) ContainerOption {
 	return func(c *Container) error {
@@ -116,4 +145,17 @@ func Variables(vars map[string]string) ContainerOption {
 
 func toEnvFormat(key, value string) string {
 	return key + "=" + value
+}
+
+// NamedVolume mounts the backend-managed volume name at containerPath, so its
+// contents outlive the container.
+func NamedVolume(name, containerPath string) ContainerOption {
+	return func(c *Container) error {
+		c.volumes = append(c.volumes, volume{
+			source: name,
+			target: containerPath,
+			named:  true,
+		})
+		return nil
+	}
 }

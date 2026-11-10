@@ -2,13 +2,16 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/taubyte/tau/core/vm"
+	"github.com/taubyte/tau/pkg/platformerr"
 	plugins "github.com/taubyte/tau/pkg/vm-low-orbit"
 	vmContext "github.com/taubyte/tau/pkg/vm/context"
 )
@@ -37,6 +40,32 @@ func (i *instance) usedMemory() (uint32, error) {
 // the cap never pool — with no room to grow, reuse only defers a mid-call OOM
 // trap, so cold-starting every call is the correct behavior for such
 // under-provisioned functions.
+// wasm memory never shrinks, so cap what a function's idle pool may hold
+// instead of letting 64 slots each grow to the function's memory cap.
+const poolMemBudget = 256 << 20
+
+// nodePooledMem is the idle pooled memory of every function on this node;
+// nodePoolBudget caps it so RSS does not climb with the function count.
+var (
+	nodePooledMem  atomic.Int64
+	nodePoolBudget = nodePoolBudgetFor(totalMemory())
+)
+
+func totalMemory() uint64 {
+	if vmStat, err := mem.VirtualMemory(); err == nil {
+		return vmStat.Total
+	}
+	return 0
+}
+
+// nodePoolBudgetFor is a quarter of the node's memory (512 MiB if unknown), at least 128 MiB.
+func nodePoolBudgetFor(total uint64) int64 {
+	if total == 0 {
+		return 512 << 20
+	}
+	return max(int64(total/4), 128<<20)
+}
+
 func shouldRetire(useMem uint32, capBytes uint64) bool {
 	return uint64(useMem) > capBytes*2/3
 }
@@ -46,6 +75,8 @@ func (i *instance) Free() error {
 		i.Close()
 		return nil
 	}
+
+	i.parent.recordModules(i.runtime)
 
 	useMem, err := i.usedMemory()
 	if err != nil {
@@ -67,8 +98,15 @@ func (i *instance) Free() error {
 		return nil
 	}
 
+	if i.parent.pooledMem.Load()+int64(useMem) > poolMemBudget ||
+		nodePooledMem.Load()+int64(useMem) > nodePoolBudget {
+		i.Close()
+		return nil
+	}
+
 	i.pooled = true
-	i.parent.availableInstances <- i
+	i.unhold()
+	i.parent.repool(i, useMem)
 	return nil
 }
 
@@ -116,7 +154,92 @@ func (i *instance) Ready() (Instance, error) {
 }
 
 func (i *instance) Close() error {
+	i.unhold()
 	return i.runtime.Close()
+}
+
+// unpool takes a pooled instance's memory off its function's pool budget.
+func unpool(inst Instance) uint32 {
+	i, ok := inst.(*instance)
+	if !ok {
+		return 0
+	}
+	mem := i.poolMem
+	i.poolMem = 0
+	i.parent.pooledMem.Add(-int64(mem))
+	nodePooledMem.Add(-int64(mem))
+	return mem
+}
+
+// hold takes the project slot of a pooled instance checked out for a request.
+func hold(inst Instance) error {
+	i, ok := inst.(*instance)
+	if !ok {
+		return nil
+	}
+	if err := i.parent.acquire(i.parent.serviceable.Project(), i.parent.config.Memory); err != nil {
+		return err
+	}
+	i.held.Store(true)
+	return nil
+}
+
+// unhold gives the slot back once, when the instance is pooled or closed.
+func (i *instance) unhold() {
+	if i.held.CompareAndSwap(true, false) {
+		release(i.parent.serviceable.Project(), i.parent.config.Memory)
+	}
+}
+
+// repool puts back a pooled instance that could not be checked out.
+// mem is the instance's memory, counted against poolMemBudget while pooled.
+// It never blocks a caller (it may hold a request lock) on a full pool.
+func (f *Function) repool(inst Instance, mem uint32) {
+	f.shutdownMu.RLock()
+	defer f.shutdownMu.RUnlock()
+	if f.drained {
+		inst.Close()
+		return
+	}
+
+	if i, ok := inst.(*instance); ok {
+		i.poolMem = mem
+		f.pooledMem.Add(int64(mem))
+		nodePooledMem.Add(int64(mem))
+	}
+	select {
+	case f.availableInstances <- inst:
+	default:
+		unpool(inst)
+		inst.Close()
+	}
+}
+
+// checkout takes a pooled instance or creates one, holding a project slot for it.
+func (f *Function) checkout() (Instance, error) {
+	select {
+	case pooled := <-f.availableInstances:
+		mem := unpool(pooled)
+		if err := hold(pooled); err != nil {
+			f.repool(pooled, mem)
+			return nil, err
+		}
+		return pooled, nil
+	default:
+	}
+
+	project, mem := f.serviceable.Project(), f.config.Memory
+	if err := f.acquire(project, mem); err != nil {
+		return nil, err
+	}
+	runtime, sdk, err := f.instantiate()
+	if err != nil {
+		release(project, mem)
+		return nil, err
+	}
+	inst := &instance{runtime: runtime, sdk: sdk, parent: f}
+	inst.held.Store(true)
+	return inst, nil
 }
 
 func (i *instance) Stdout() io.Reader {
@@ -141,13 +264,15 @@ func (f *Function) Instantiate(ctx context.Context) (Instance, error) { //} (run
 	select {
 	case f.instanceReqs <- instCh:
 	default:
-		return nil, fmt.Errorf("instance request channel is full")
+		return nil, platformerr.New(platformerr.NodeBusy, errors.New("instance request channel is full"))
 	}
 
 	select {
 	case <-f.ctx.Done():
+		instCh.leave()
 		return nil, fmt.Errorf("function context done with: %w", f.ctx.Err())
 	case <-ctx.Done():
+		instCh.leave()
 		return nil, fmt.Errorf("instance request not sent: %w", ctx.Err())
 	case instance := <-instCh.ch:
 		if instCh.err != nil {
@@ -179,29 +304,38 @@ func (f *Function) intanceManager() {
 }
 
 func (f *Function) processRequest(reqCh *instanceRequest) {
+	inst, err := f.checkout()
+	if err == nil {
+		reqCh.give(inst)
+		return
+	}
+
+	// A refusal is normal back-pressure, and can come once per request.
+	logf := logger.Errorf
+	if c := platformerr.CodeOf(err); c == platformerr.NodeBusy || c == platformerr.OverQuota {
+		logf = logger.Debugf
+	}
+	logf("creating new instance failed with: %s", err.Error())
+	// Refuse unless an instance is free right now: the caller's context lasts
+	// as long as the function, and waiting would stall its whole request queue.
 	select {
-	case instance := <-f.availableInstances:
-		reqCh.ch <- instance
-	default:
-		// we need to instantiate a new instance
-		// hoever if that does not work we need to repush the request in a way that is it first in line
-		runtime, sdk, err := f.instantiate()
-		if err == nil {
-			reqCh.ch <- &instance{runtime: runtime, sdk: sdk, parent: f}
-		} else {
-			logger.Errorf("creating new instance failed with: %s", err.Error())
-			// we reached some sort of limit
-			// wait for an instance to be available
-			select {
-			case <-reqCh.ctx.Done():
-				reqCh.err = fmt.Errorf("instance request context done with: %w", reqCh.ctx.Err())
-				reqCh.ch <- nil
-			case instance := <-f.availableInstances:
-				reqCh.ch <- instance
-			case <-f.ctx.Done():
-				return
-			}
+	case <-reqCh.ctx.Done():
+		reqCh.err = fmt.Errorf("instance request context done with: %w", reqCh.ctx.Err())
+		reqCh.give(nil)
+	case pooled := <-f.availableInstances:
+		mem := unpool(pooled)
+		if err := hold(pooled); err != nil {
+			f.repool(pooled, mem)
+			reqCh.err = err
+			reqCh.give(nil)
+			return
 		}
+		reqCh.give(pooled)
+	case <-f.ctx.Done():
+		return
+	default:
+		reqCh.err = err
+		reqCh.give(nil)
 	}
 }
 
@@ -225,7 +359,7 @@ func (f *Function) instantiate() (rt vm.Runtime, sdk plugins.Instance, err error
 
 		availableMemory := goMemory + (vmStat.Total - vmStat.Used)
 		if availableMemory*2/3 < f.config.Memory {
-			return nil, nil, fmt.Errorf("insufficient system memory available: %d bytes", availableMemory)
+			return nil, nil, platformerr.New(platformerr.NodeBusy, fmt.Errorf("insufficient system memory available: %d bytes", availableMemory))
 		}
 	}
 
@@ -288,6 +422,11 @@ func (f *Function) instantiate() (rt vm.Runtime, sdk plugins.Instance, err error
 	}
 
 	return
+}
+
+// acquire reserves the project's share for one more instance.
+func (f *Function) acquire(project string, mem uint64) error {
+	return acquire(project, mem, f.serviceable.Service().Caps(project))
 }
 
 func (f *Function) configureVM() error {

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,14 +18,28 @@ import (
 	"github.com/taubyte/tau/pkg/kvdb"
 	hoarderSpecs "github.com/taubyte/tau/pkg/specs/hoarder"
 	"github.com/taubyte/tau/utils/maps"
+	"golang.org/x/sync/singleflight"
 )
 
 // ErrNotFound is returned by the remote KVDB's Get when the key is absent.
 var ErrNotFound = errors.New("key not found")
 
+// ErrOverCapacity is returned when the hoarder refused a write: the database
+// quota or the node's admission policy.
+var ErrOverCapacity = errors.New("no space left for input")
+
+// refused turns a typed refusal in a response into an error.
+func refused(resp cr.Response) error {
+	if maps.TryString(resp, hoarderSpecs.BodyCode) == hoarderSpecs.CodeOverCapacity {
+		return ErrOverCapacity
+	}
+	return nil
+}
+
 // KVDB returns a remote-backed kvdb.KVDB for a database/storage instance. Every
 // operation is a p2p call to a hoarder holding the instance; the handle resolves
-// replicas lazily and sticks to one (read-your-writes) with failover.
+// replicas lazily and sticks to one with failover for writes and for the reads
+// that must see them. Other database reads are spread: see readTarget.
 func (c *Client) KVDB(kind hoarderIface.ResourceKind, project, application, match, branch string) (coreKvdb.KVDB, error) {
 	return &remoteKV{
 		client:      c,
@@ -31,6 +48,10 @@ func (c *Client) KVDB(kind hoarderIface.ResourceKind, project, application, matc
 		application: application,
 		match:       match,
 		branch:      branch,
+		resolve: func() ([]peerCore.ID, error) {
+			return c.ReplicasOf(kind, project, application, match)
+		},
+		send: c.Send,
 	}, nil
 }
 
@@ -42,13 +63,25 @@ type remoteKV struct {
 	match       string
 	branch      string
 
+	resolve func() ([]peerCore.ID, error) // replica lookup; a field so tests can stall it
+	send    func(cmd string, body command.Body, peers ...peerCore.ID) (cr.Response, error)
+
+	lookup   singleflight.Group
 	mu       sync.Mutex
 	replicas []peerCore.ID
 	sticky   int
+
+	// readers is apart from replicas so that read routing never moves the
+	// sticky replica the writes go to.
+	readers   []peerCore.ID
+	readersAt time.Time
+	written   map[string]time.Time // key -> when this handle last wrote it
+	sweptAt   time.Time
 }
 
 var _ coreKvdb.KVDB = (*remoteKV)(nil)
 var _ hoarderIface.NxKVDB = (*remoteKV)(nil)
+var _ hoarderIface.QuotaKVDB = (*remoteKV)(nil)
 
 func (r *remoteKV) instanceBody() command.Body {
 	return command.Body{
@@ -62,22 +95,45 @@ func (r *remoteKV) instanceBody() command.Body {
 
 // target returns the current sticky replica, resolving the set on first use.
 // An empty return means no replicas are known yet — the op goes to any hoarder,
-// which first-touches the resource.
-func (r *remoteKV) target() (peerCore.ID, error) {
+// which first-touches the resource. The lookup is network I/O, so it runs
+// outside r.mu and concurrent callers share one lookup; each caller waits only
+// until its own ctx ends.
+func (r *remoteKV) target(ctx context.Context) (peerCore.ID, error) {
+	if pid, ok := r.current(); ok {
+		return pid, nil
+	}
+	ch := r.lookup.DoChan("", func() (interface{}, error) {
+		peers, err := r.resolve()
+		if err == nil && len(peers) > 0 {
+			r.mu.Lock()
+			if len(r.replicas) == 0 {
+				r.replicas = peers
+				r.sticky = 0
+			}
+			r.mu.Unlock()
+		}
+		return nil, err
+	})
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return "", res.Err
+		}
+	}
+	pid, _ := r.current()
+	return pid, nil
+}
+
+// current returns the sticky replica if the set is known.
+func (r *remoteKV) current() (peerCore.ID, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.replicas) == 0 {
-		peers, err := r.client.ReplicasOf(r.kind, r.project, r.application, r.match)
-		if err != nil {
-			return "", err
-		}
-		r.replicas = peers
-		r.sticky = 0
+		return "", false
 	}
-	if len(r.replicas) == 0 {
-		return "", nil
-	}
-	return r.replicas[r.sticky%len(r.replicas)], nil
+	return r.replicas[r.sticky%len(r.replicas)], true
 }
 
 func (r *remoteKV) failover() bool {
@@ -126,15 +182,33 @@ const (
 	coldStartBackoff = 1500 * time.Millisecond
 )
 
+// OpTimeout bounds a kvdb op whose caller gave no deadline, so a stuck
+// replica fails the op instead of holding the caller forever.
+var OpTimeout = 30 * time.Second
+
+func opContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, OpTimeout)
+}
+
+func (r *remoteKV) opBody(extra command.Body) command.Body {
+	body := r.instanceBody()
+	for k, v := range extra {
+		body[k] = v
+	}
+	return body
+}
+
 // do sends a kvdb op to the sticky replica, retrying across mesh warmup and
 // failing over to other replicas on a transport error and following a
 // not-replica redirect. It honors ctx: a caller that gave up neither sleeps
 // through the cold-start backoff nor starts another round.
 func (r *remoteKV) do(ctx context.Context, extra command.Body) (cr.Response, error) {
-	body := r.instanceBody()
-	for k, v := range extra {
-		body[k] = v
-	}
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+	body := r.opBody(extra)
 
 	var lastErr error
 	for round := 0; round < coldStartRetries; round++ {
@@ -172,7 +246,10 @@ func (r *remoteKV) attempt(ctx context.Context, body command.Body) (cr.Response,
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		pid, err := r.target()
+		pid, err := r.target(ctx)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
 			// No hoarder reachable yet — fall back to "any hoarder" so an unplaced
 			// resource can still first-touch once discovery completes.
@@ -181,9 +258,9 @@ func (r *remoteKV) attempt(ctx context.Context, body command.Body) (cr.Response,
 
 		var resp cr.Response
 		if pid == "" {
-			resp, err = r.client.Send(hoarderSpecs.KVDBCommand, body)
+			resp, err = r.send(hoarderSpecs.KVDBCommand, body)
 		} else {
-			resp, err = r.client.Send(hoarderSpecs.KVDBCommand, body, pid)
+			resp, err = r.send(hoarderSpecs.KVDBCommand, body, pid)
 		}
 		if err != nil {
 			if r.failover() {
@@ -222,10 +299,154 @@ func (r *remoteKV) pinServer(id string) {
 	}
 }
 
-func (r *remoteKV) Get(ctx context.Context, key string) ([]byte, error) {
-	resp, err := r.do(ctx, command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVGet, hoarderSpecs.BodyKey: key})
+// LocalHandler answers a kvdb command inside this process.
+type LocalHandler func(ctx context.Context, body command.Body) (cr.Response, error)
+
+// localHoarders holds the hoarders running in this process, by peer id. Substrate
+// dials through its client node, whose id differs from the hoarder's, so the
+// replica list alone cannot say which replica is on this machine.
+var localHoarders sync.Map // peerCore.ID -> LocalHandler
+
+// ServeLocal lets clients in this process reach the hoarder id without a
+// network hop. The returned func withdraws it.
+func ServeLocal(id peerCore.ID, h LocalHandler) (stop func()) {
+	localHoarders.Store(id, h)
+	return func() { localHoarders.Delete(id) }
+}
+
+const (
+	// readYourWritesWindow is how long a handle's reads of a key it wrote stay on
+	// the sticky replica. Minutes, not a few rebroadcasts: a replica behind a DAG
+	// backlog can lag far longer than the gossip interval. After it, and for keys
+	// written elsewhere, a read can be stale for as long as its replica lags.
+	readYourWritesWindow = 5 * time.Minute
+	readersRefresh       = 30 * time.Second
+)
+
+func canonicalKey(key string) string { return path.Clean("/" + key) }
+
+// wrote starts the read-your-writes window of keys. Callers run it whether or
+// not the write reported success, since a timed-out write may still have landed.
+func (r *remoteKV) wrote(keys ...string) {
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.written == nil {
+		r.written = make(map[string]time.Time, len(keys))
+	}
+	if now.Sub(r.sweptAt) > readYourWritesWindow {
+		r.sweptAt = now
+		for k, at := range r.written {
+			if now.Sub(at) >= readYourWritesWindow {
+				delete(r.written, k)
+			}
+		}
+	}
+	for _, k := range keys {
+		r.written[canonicalKey(k)] = now
+	}
+}
+
+func (r *remoteKV) refreshReaders() {
+	peers, err := r.resolve()
+	if err != nil || len(peers) == 0 {
+		return
+	}
+	r.mu.Lock()
+	r.readers = peers
+	r.mu.Unlock()
+}
+
+// readTarget picks the replica a Get may use instead of the sticky one: the
+// hoarder in this process when it is a replica, otherwise a random replica. It
+// reports false when the Get must stay on the sticky path: storage metadata
+// (a stale version would be reused), quota inputs, keys this handle just wrote,
+// or no replica known yet. The lookup runs in the background so a hung
+// ReplicasOf never delays a read.
+func (r *remoteKV) readTarget(key string) (peerCore.ID, bool) {
+	k := canonicalKey(key)
+	if r.kind == hoarderIface.Storage || strings.HasPrefix(k, "/size/") {
+		return "", false
+	}
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if now.Sub(r.written[k]) < readYourWritesWindow {
+		return "", false
+	}
+	if now.Sub(r.readersAt) > readersRefresh {
+		r.readersAt = now
+		go r.refreshReaders()
+	}
+	if len(r.readers) == 0 {
+		return "", false
+	}
+	candidates := r.readers
+	var local []peerCore.ID
+	for _, pid := range r.readers {
+		if _, ok := localHoarders.Load(pid); ok {
+			local = append(local, pid)
+		}
+	}
+	if len(local) > 0 {
+		candidates = local
+	}
+	return candidates[rand.IntN(len(candidates))], true
+}
+
+func (r *remoteKV) dropReader(pid peerCore.ID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]peerCore.ID, 0, len(r.readers))
+	for _, p := range r.readers {
+		if p != pid {
+			kept = append(kept, p)
+		}
+	}
+	r.readers = kept
+}
+
+// readReplica tries a Get on a spread replica. A nil response sends the Get down
+// the sticky path, which keeps every failover, redirect and first-touch rule. A
+// miss goes there too, as a replica that lacks the key may simply be behind.
+func (r *remoteKV) readReplica(ctx context.Context, key string, extra command.Body) cr.Response {
+	pid, ok := r.readTarget(key)
+	if !ok {
+		return nil
+	}
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	var resp cr.Response
+	var err error
+	if h, local := localHoarders.Load(pid); local {
+		resp, err = h.(LocalHandler)(ctx, r.opBody(extra))
+	} else {
+		resp, err = r.send(hoarderSpecs.KVDBCommand, r.opBody(extra), pid)
+	}
 	if err != nil {
-		return nil, err
+		if ctx.Err() == nil {
+			r.dropReader(pid) // back at the next refresh if it is still a live claimant
+		}
+		return nil
+	}
+	switch maps.TryString(resp, hoarderSpecs.BodyCode) {
+	case "":
+		return resp
+	case hoarderSpecs.CodeNotReplica:
+		r.dropReader(pid) // a local replica is otherwise asked first on every read
+	}
+	return nil
+}
+
+func (r *remoteKV) Get(ctx context.Context, key string) ([]byte, error) {
+	op := command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVGet, hoarderSpecs.BodyKey: key}
+	resp := r.readReplica(ctx, key, op)
+	if resp == nil {
+		var err error
+		if resp, err = r.do(ctx, op); err != nil {
+			return nil, err
+		}
 	}
 	if maps.TryString(resp, hoarderSpecs.BodyCode) == hoarderSpecs.CodeNotFound {
 		return nil, ErrNotFound
@@ -234,16 +455,24 @@ func (r *remoteKV) Get(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (r *remoteKV) Put(ctx context.Context, key string, v []byte) error {
-	_, err := r.do(ctx, command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVPut, hoarderSpecs.BodyKey: key, hoarderSpecs.BodyValue: v})
-	return err
+	defer r.wrote(key)
+	resp, err := r.do(ctx, command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVPut, hoarderSpecs.BodyKey: key, hoarderSpecs.BodyValue: v})
+	if err != nil {
+		return err
+	}
+	return refused(resp)
 }
 
 // PutNx writes the key only if absent on the serving replica, atomically
 // against concurrent writes there. Returns existed=true when the key was
 // already present (nothing written).
 func (r *remoteKV) PutNx(ctx context.Context, key string, v []byte) (bool, error) {
+	defer r.wrote(key)
 	resp, err := r.do(ctx, command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVPutNx, hoarderSpecs.BodyKey: key, hoarderSpecs.BodyValue: v})
 	if err != nil {
+		return false, err
+	}
+	if err = refused(resp); err != nil {
 		return false, err
 	}
 	existed, _ := maps.Bool(resp, hoarderSpecs.BodyExisted)
@@ -251,6 +480,7 @@ func (r *remoteKV) PutNx(ctx context.Context, key string, v []byte) (bool, error
 }
 
 func (r *remoteKV) Delete(ctx context.Context, key string) error {
+	defer r.wrote(key)
 	_, err := r.do(ctx, command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVDelete, hoarderSpecs.BodyKey: key})
 	return err
 }
@@ -314,7 +544,14 @@ func (r *remoteKV) Sync(ctx context.Context, key string) error {
 }
 
 func (r *remoteKV) Batch(ctx context.Context) (coreKvdb.Batch, error) {
-	return &remoteBatch{kv: r}, nil
+	return &remoteBatch{ctx: ctx, kv: r}, nil
+}
+
+// BatchWithMax is Batch with the database quota sent along, enforced by the
+// hoarder from its local data. A hoarder that predates the field ignores it,
+// so during a rolling upgrade the quota is not enforced.
+func (r *remoteKV) BatchWithMax(ctx context.Context, max uint64) (coreKvdb.Batch, error) {
+	return &remoteBatch{ctx: ctx, kv: r, max: max}, nil
 }
 
 // Stats over the wire is not yet mapped; return an empty CRDT stats so callers
@@ -331,8 +568,10 @@ func (r *remoteKV) Close() {}
 
 // remoteBatch buffers ops and applies them as one grouped batch on Commit.
 type remoteBatch struct {
+	ctx context.Context // from Batch(ctx): Commit takes no ctx
 	kv  *remoteKV
 	ops []command.Body
+	max uint64 // database quota in bytes; 0 = not sent
 }
 
 func (b *remoteBatch) Put(key string, value []byte) error {
@@ -357,10 +596,19 @@ func (b *remoteBatch) Commit() error {
 		return nil
 	}
 	ops := make([]interface{}, len(b.ops))
+	keys := make([]string, len(b.ops))
 	for i, o := range b.ops {
 		ops[i] = map[string]interface{}(o)
+		keys[i] = maps.TryString(o, hoarderSpecs.BodyKey)
 	}
-	// The Batch interface's Commit carries no ctx; the op is not caller-cancellable.
-	_, err := b.kv.do(context.Background(), command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVBatch, hoarderSpecs.BodyOps: ops})
-	return err
+	defer b.kv.wrote(keys...)
+	body := command.Body{hoarderSpecs.BodyKVOp: hoarderSpecs.KVBatch, hoarderSpecs.BodyOps: ops}
+	if b.max > 0 {
+		body[hoarderSpecs.BodyMaxSize] = b.max
+	}
+	resp, err := b.kv.do(b.ctx, body)
+	if err != nil {
+		return err
+	}
+	return refused(resp)
 }

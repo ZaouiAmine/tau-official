@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/taubyte/tau/p2p/peer"
 	cr "github.com/taubyte/tau/p2p/streams/command/response"
+	"github.com/taubyte/tau/pkg/platformerr"
 
 	"github.com/libp2p/go-libp2p/core/discovery"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -43,12 +45,32 @@ type Client struct {
 	cleanPeers   chan peerCore.ID
 	peerRequests chan *peerRequest
 	peerFeeds    []*peerRequest
+
+	inFlight sync.Map // peerCore.ID -> chan struct{}, one slot per call in flight
 }
 
 type peerRequest struct {
 	ch   chan *peerCore.AddrInfo
 	ctx  context.Context
 	need int
+
+	seen      map[peerCore.ID]struct{} // peers this call already has; owned by discover
+	exhausted chan struct{}            // closed once every known peer is in seen
+	done      bool                     // exhausted is closed; owned by discover
+}
+
+// offer hands p to the call unless it already has it. A peer that does not fit
+// the buffer stays unseen and is offered again on the next retry tick.
+func (pr *peerRequest) offer(p *peerCore.AddrInfo) {
+	if _, ok := pr.seen[p.ID]; ok {
+		return
+	}
+	select {
+	case pr.ch <- p:
+		pr.seen[p.ID] = struct{}{}
+	case <-pr.ctx.Done():
+	default:
+	}
 }
 
 type Request struct {
@@ -124,6 +146,13 @@ func (r *Response) PID() peerCore.ID { return r.pid }
 type stream struct {
 	network.Stream
 	peerCore.ID
+	slot chan struct{} // this call's in-flight slot; nil if it holds none
+}
+
+func (s stream) release() {
+	if s.slot != nil {
+		<-s.slot
+	}
 }
 
 var (
@@ -132,6 +161,17 @@ var (
 	DefaultMaxPeers    int = 16
 	DefaultMaxParallel int = 64
 	MaxStreamsPerSend  int = 16
+
+	// MaxInFlightPerPeer caps one client's calls in flight to one peer. A peer
+	// resets streams over its per-protocol-per-peer limit: 1024 for /tns/v1 and
+	// /hoarder/v1 (p2p/helpers cloudLimits). 256 lets four clients of a protocol
+	// on one node stay under that. Other protocols keep libp2p's defaults, about
+	// 70, and only the retry below covers them.
+	MaxInFlightPerPeer int = 256
+
+	// LimitRetryDelay spaces retries of a call its peer refused for being over
+	// the stream limit; each wait is random in [delay/2, delay).
+	LimitRetryDelay time.Duration = 100 * time.Millisecond
 
 	// PeerRetryInterval bounds how long a pending send can be stuck behind a
 	// discovery gap (e.g. identify hasn't updated the peerstore yet, or a
@@ -142,6 +182,9 @@ var (
 	SendToPeerTimeout time.Duration = 10 * time.Second
 	ConnectTimeout    time.Duration = 500 * time.Millisecond
 )
+
+// limitRetries bounds the retries of a call refused for the stream limit.
+const limitRetries = 2
 
 func (c *Client) Context() context.Context { return c.ctx }
 
@@ -235,24 +278,31 @@ func (c *Client) addPeer(p *peerCore.AddrInfo) {
 	c.activePeers[p.ID] = p
 	c.node.Peer().ConnManager().Protect(p.ID, c.tag)
 
-	kept := make([]*peerRequest, 0, len(c.peerFeeds))
 	for _, pr := range c.peerFeeds {
-		select {
-		case <-pr.ctx.Done():
-			close(pr.ch)
-			continue
-		default:
-		}
-		select {
-		case pr.ch <- p:
-			kept = append(kept, pr)
-		case <-pr.ctx.Done():
-			close(pr.ch)
-		default:
-			kept = append(kept, pr)
-		}
+		pr.offer(p)
 	}
-	c.peerFeeds = kept
+}
+
+// markExhausted tells calls that hold every known peer to stop waiting for more.
+// settled is false at startup, when an empty or short list only means discovery
+// and identify have not caught up yet.
+func (c *Client) markExhausted(settled bool) {
+	if !settled {
+		return
+	}
+feeds:
+	for _, pr := range c.peerFeeds {
+		if pr.done || len(pr.seen) == 0 {
+			continue
+		}
+		for pid := range c.activePeers {
+			if _, ok := pr.seen[pid]; !ok {
+				continue feeds
+			}
+		}
+		pr.done = true
+		close(pr.exhausted)
+	}
 }
 
 func (c *Client) discover() {
@@ -268,6 +318,10 @@ func (c *Client) discover() {
 	c.refreshFromPeerStore()
 	dpeers := c.discPeers()
 	discoverDone := false
+	discovered := false // a discovery round has finished since New
+	started := time.Now()
+	grace := PeerRetryInterval
+	settled := func() bool { return discovered && time.Since(started) >= grace }
 	dpeersWait := make(chan peerCore.AddrInfo)
 
 	retry := time.NewTicker(PeerRetryInterval)
@@ -281,7 +335,9 @@ func (c *Client) discover() {
 		case p, ok := <-dpeers:
 			if !ok {
 				discoverDone = true
+				discovered = true
 				dpeers = dpeersWait
+				c.markExhausted(settled())
 				continue
 			}
 			c.addPeer(&p)
@@ -290,19 +346,8 @@ func (c *Client) discover() {
 			c.cleanPeer(pid)
 
 		case pr := <-c.peerRequests:
-		peerLoop:
 			for _, info := range c.activePeers {
-				select {
-				case pr.ch <- info:
-				case <-pr.ctx.Done():
-					close(pr.ch)
-					pr = nil
-					break peerLoop
-				default:
-				}
-			}
-			if pr == nil {
-				continue
+				pr.offer(info)
 			}
 			c.peerFeeds = append(c.peerFeeds, pr)
 
@@ -313,6 +358,7 @@ func (c *Client) discover() {
 					discoverDone = false
 				}
 			}
+			c.markExhausted(settled())
 
 		case <-retry.C:
 			// event-driven discovery only refreshes when a peerRequest
@@ -335,6 +381,11 @@ func (c *Client) discover() {
 			c.peerFeeds = kept
 
 			c.refreshFromPeerStore()
+			for _, pr := range c.peerFeeds {
+				for _, info := range c.activePeers {
+					pr.offer(info)
+				}
+			}
 
 			needMore := false
 			for _, pr := range c.peerFeeds {
@@ -344,10 +395,24 @@ func (c *Client) discover() {
 				}
 			}
 			if needMore && discoverDone {
-				dpeers = c.discPeers()
+				dpeers = c.discPeers() // the end of this round marks exhausted calls
 				discoverDone = false
+			} else {
+				c.markExhausted(settled())
 			}
 		}
+	}
+}
+
+// acquire waits for an in-flight slot to pid, for as long as ctx allows.
+func (c *Client) acquire(ctx context.Context, pid peerCore.ID) (chan struct{}, error) {
+	v, _ := c.inFlight.LoadOrStore(pid, make(chan struct{}, MaxInFlightPerPeer))
+	slot := v.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+		return slot, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting for a free stream to peer %s failed: %w", pid, ctx.Err())
 	}
 }
 
@@ -359,28 +424,37 @@ func (c *Client) openStream(pid peerCore.ID) (stream, error) {
 	return stream{Stream: strm, ID: pid}, nil
 }
 
-func (c *Client) peers(ctx context.Context, needs int) <-chan *peerCore.AddrInfo {
-	ch := make(chan *peerCore.AddrInfo, c.maxPeers)
+// peers asks discovery for peers of one call; used are the peers it already has.
+func (c *Client) peers(ctx context.Context, needs int, used []stream) *peerRequest {
+	req := &peerRequest{
+		ch:        make(chan *peerCore.AddrInfo, c.maxPeers),
+		ctx:       ctx,
+		need:      needs,
+		seen:      make(map[peerCore.ID]struct{}, needs),
+		exhausted: make(chan struct{}),
+	}
+	for _, strm := range used {
+		req.seen[strm.ID] = struct{}{}
+	}
+
 	select {
 	case <-ctx.Done():
-		close(ch)
-		return ch
+		close(req.ch)
+		return req
 	case <-c.ctx.Done():
-		close(ch)
-		return ch
+		close(req.ch)
+		return req
 	default:
 	}
 
-	req := &peerRequest{ch: ch, ctx: ctx, need: needs}
-
 	select {
 	case <-ctx.Done():
-		close(ch)
+		close(req.ch)
 	case <-c.ctx.Done():
-		close(ch)
+		close(req.ch)
 	case c.peerRequests <- req:
 	}
-	return ch
+	return req
 }
 
 func (c *Client) connect(p *peerCore.AddrInfo) (network.Stream, error) {
@@ -419,37 +493,71 @@ func (r *Request) Do() (<-chan *Response, error) {
 	default:
 	}
 
+	timeout := r.cmdTimeout
+	if timeout == 0 {
+		timeout = SendToPeerTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
 	if len(r.to) > 0 {
+		ctx, ctxC := context.WithDeadline(r.client.ctx, deadline)
+		defer ctxC()
+
+		var lastErr error
 		strms := make([]stream, 0, r.threshold)
 		for _, pid := range r.to {
 			if len(strms) >= r.threshold {
 				break
 			}
-			strm, err := r.client.openStream(pid)
-			if err != nil {
+			if slices.ContainsFunc(strms, func(s stream) bool { return s.ID == pid }) {
 				continue
 			}
+			slot, err := r.client.acquire(ctx, pid)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			strm, err := r.client.openStream(pid)
+			if err != nil {
+				<-slot
+				lastErr = err
+				continue
+			}
+			strm.slot = slot
 			strms = append(strms, strm)
 		}
 		if len(strms) == 0 {
-			return nil, fmt.Errorf("no streams could be opened for command %q", r.cmd)
+			return nil, fmt.Errorf("no streams could be opened for command %q: %w", r.cmd, lastErr)
 		}
-		return r.client.send(r.cmd, r.body, strms, r.threshold, r.cmdTimeout)
+		resCh, err := r.client.send(r.cmd, r.body, strms, r.threshold, deadline)
+		if err != nil {
+			for _, strm := range strms {
+				strm.Reset()
+				strm.release()
+			}
+		}
+		return resCh, err
 	}
 
-	return r.client.send(r.cmd, r.body, nil, r.threshold, r.cmdTimeout)
+	return r.client.send(r.cmd, r.body, nil, r.threshold, deadline)
 }
 
 func (r *Response) CloseRead() {
-	r.ReadWriter.(network.Stream).CloseRead()
+	if s, ok := r.ReadWriter.(network.Stream); ok {
+		s.CloseRead()
+	}
 }
 
 func (r *Response) CloseWrite() {
-	r.ReadWriter.(network.Stream).CloseWrite()
+	if s, ok := r.ReadWriter.(network.Stream); ok {
+		s.CloseWrite()
+	}
 }
 
 func (r *Response) Close() {
-	r.ReadWriter.(network.Stream).Reset()
+	if s, ok := r.ReadWriter.(network.Stream); ok { // no stream if none could be opened
+		s.Reset()
+	}
 }
 
 func (c *Client) sendTo(strm stream, deadline time.Time, cmdName string, body command.Body) *Response {
@@ -496,11 +604,11 @@ func (c *Client) sendTo(strm stream, deadline time.Time, cmdName string, body co
 		}
 	}
 
-	if v, k := resp["error"]; k {
+	if err := peerError(strm.ID, cmdName, resp); err != nil {
 		return &Response{
 			ReadWriter: strm.Stream,
 			pid:        strm.ID,
-			err:        fmt.Errorf("peer %s returned error for command %q: %v", strm.ID, cmdName, v),
+			err:        err,
 		}
 	}
 
@@ -511,25 +619,66 @@ func (c *Client) sendTo(strm stream, deadline time.Time, cmdName string, body co
 	}
 }
 
-func (c *Client) send(cmdName string, body command.Body, streams []stream, threshold int, timeout time.Duration) (<-chan *Response, error) {
+// limitExceeded reports whether the peer reset the stream for being over its
+// stream limit. libp2p sends that code only before a stream reaches its handler
+// (swarm_conn AcceptStream, basic_host newStreamHandler), so the peer has not
+// seen the command and replaying any command is safe, writes included. A code
+// from the local side, or an error the peer's handler returned, does not match.
+func limitExceeded(err error) bool {
+	var se *network.StreamError
+	return errors.As(err, &se) && se.Remote && se.ErrorCode == network.StreamResourceLimitExceeded
+}
+
+// sendRetrying is sendTo, repeated on a fresh stream at most limitRetries times
+// while the peer refuses the stream for being over its limit. It keeps the
+// call's slot and deadline throughout.
+func (c *Client) sendRetrying(ctx context.Context, strm stream, deadline time.Time, cmdName string, body command.Body) *Response {
+	res := c.sendTo(strm, deadline, cmdName, body)
+	for try := 0; try < limitRetries && limitExceeded(res.err); try++ {
+		select {
+		case <-ctx.Done():
+			return res
+		case <-time.After(LimitRetryDelay/2 + rand.N(LimitRetryDelay/2)):
+		}
+		next, err := c.openStream(strm.ID)
+		if err != nil {
+			return res
+		}
+		strm.Stream.Reset()
+		strm.Stream = next.Stream
+		res = c.sendTo(strm, deadline, cmdName, body)
+	}
+	return res
+}
+
+// peerError is the error a peer answered with, or nil.
+func peerError(pid peerCore.ID, cmdName string, resp cr.Response) error {
+	v, k := resp["error"]
+	if !k {
+		return nil
+	}
+	if code, ok := resp["code"].(string); ok && code != "" {
+		return fmt.Errorf("peer %s returned error for command %q: %w", pid, cmdName, platformerr.New(platformerr.Code(code), errors.New(fmt.Sprint(v))))
+	}
+	return fmt.Errorf("peer %s returned error for command %q: %v", pid, cmdName, v)
+}
+
+func (c *Client) send(cmdName string, body command.Body, streams []stream, threshold int, deadline time.Time) (<-chan *Response, error) {
 	select {
 	case <-c.ctx.Done():
 		return nil, errors.New("client context ended")
 	default:
 	}
 
-	if timeout == 0 {
-		timeout = SendToPeerTimeout
-	}
-
 	if threshold > MaxStreamsPerSend {
 		return nil, fmt.Errorf("threshold %d exceeds MaxStreamsPerSend", threshold)
 	}
 
-	ctx, ctxC := context.WithTimeout(c.ctx, timeout)
+	ctx, ctxC := context.WithDeadline(c.ctx, deadline)
 
 	cmdDD, _ := ctx.Deadline()
 
+	responses := make(chan *Response, MaxStreamsPerSend)
 	strms := make(chan stream, MaxStreamsPerSend)
 	strmsCount := len(streams)
 
@@ -548,29 +697,41 @@ func (c *Client) send(cmdName string, body command.Body, streams []stream, thres
 		go func() {
 			defer close(strms)
 
-			discPeers := c.peers(ctx, threshold)
+			req := c.peers(ctx, threshold, streams)
+			discPeers, exhausted, noMorePeers := req.ch, req.exhausted, false
 
 		morePeersLoop:
 			for {
-				if strmsCount >= threshold {
+				// with nothing connected yet, keep waiting: a dead list may still be replaced
+				if strmsCount >= threshold || (noMorePeers && strmsCount > 0 && len(discPeers) == 0) {
 					return
 				}
 				select {
 				case <-ctx.Done():
 					return
+				case <-exhausted:
+					noMorePeers, exhausted = true, nil
 				case peer := <-discPeers:
 					if peer == nil {
 						break morePeersLoop
 					}
+					slot, err := c.acquire(ctx, peer.ID)
+					if err != nil {
+						responses <- &Response{pid: peer.ID, err: err}
+						return
+					}
 					strm, err := c.connect(peer)
 					if err != nil {
+						<-slot
 						c.cleanPeers <- peer.ID
 						continue morePeersLoop
 					}
 					strmsCount++
 					select {
-					case strms <- stream{Stream: strm, ID: peer.ID}:
+					case strms <- stream{Stream: strm, ID: peer.ID, slot: slot}:
 					case <-ctx.Done():
+						strm.Reset()
+						<-slot
 						return
 					}
 				}
@@ -580,7 +741,6 @@ func (c *Client) send(cmdName string, body command.Body, streams []stream, thres
 		close(strms)
 	}
 
-	responses := make(chan *Response, MaxStreamsPerSend)
 	go func() {
 		defer close(responses)
 		defer ctxC()
@@ -592,6 +752,7 @@ func (c *Client) send(cmdName string, body command.Body, streams []stream, thres
 			wg.Add(1)
 			go func(_strm stream) {
 				defer wg.Done()
+				defer _strm.release()
 				select {
 				case <-ctx.Done():
 					responses <- &Response{
@@ -599,7 +760,7 @@ func (c *Client) send(cmdName string, body command.Body, streams []stream, thres
 						pid:        _strm.ID,
 						err:        ctx.Err(),
 					}
-				case responses <- c.sendTo(_strm, cmdDD, cmdName, body):
+				case responses <- c.sendRetrying(ctx, _strm, cmdDD, cmdName, body):
 				}
 			}(strm)
 		}
@@ -619,6 +780,12 @@ func (c *Client) syncSend(cmd string, opts ...Option[Request]) (cr.Response, err
 		return nil, fmt.Errorf("command %q timed out: %w", cmd, os.ErrDeadlineExceeded)
 	}
 	defer res.Close()
+	// only the first response is used; the others' streams must still be closed
+	go func() {
+		for extra := range resCh {
+			extra.Close()
+		}
+	}()
 
 	if err := res.Error(); err != nil {
 		return res.Response, fmt.Errorf("command %q returned error: %w", cmd, err)

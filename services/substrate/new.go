@@ -19,6 +19,7 @@ import (
 	orbit "github.com/taubyte/tau/pkg/vm-orbit/satellite/vm"
 	seer "github.com/taubyte/tau/pkg/yaseer"
 	protocolCommon "github.com/taubyte/tau/services/common"
+	httpComp "github.com/taubyte/tau/services/substrate/components/http"
 	"github.com/taubyte/tau/services/substrate/migration"
 )
 
@@ -35,6 +36,7 @@ func New(ctx context.Context, cfg tauConfig.Config) (*Service, error) {
 
 	var err error
 	srv.dev = cfg.DevMode()
+	srv.quotas = cfg.Quotas()
 	srv.verbose = cfg.Verbose()
 	srv.cluster = cfg.Cluster()
 
@@ -65,8 +67,22 @@ func New(ctx context.Context, cfg tauConfig.Config) (*Service, error) {
 	// Move any node-local project data (an upgraded node's databases, storage
 	// metadata and file bytes) to the hoarders before serving: bounded
 	// synchronous pass, background continuation past the bound. Fresh nodes
-	// pay one empty prefix query.
-	srv.migrator = migration.New(ctx, srv.node, srv.hoarderClient, srv.tns)
+	// pay one empty prefix query, migrated nodes one key lookup.
+	//
+	// A scrub treats every kvdb namespace and block it reaches as substrate's
+	// own. Sharing a node (the "all" shape), the store also holds the other
+	// services' databases and blocks — monkey's build artifacts, hoarder's
+	// hosted instances — so there the data is replayed and nothing is deleted.
+	var opts []migration.Option
+	if !cfg.Substrate().MigrationEnabled() {
+		logger.Info("node-local data migration disabled by config")
+		opts = append(opts, migration.Disabled())
+	}
+	if others := coLocatedServices(cfg.Services()); len(others) > 0 {
+		logger.Infof("node-local data migration keeps local data: the node's store is shared with %v", others)
+		opts = append(opts, migration.KeepLocal())
+	}
+	srv.migrator = migration.New(ctx, srv.node, srv.hoarderClient, srv.tns, opts...)
 	srv.migrator.Boot()
 
 	if err = srv.startVm(); err != nil {
@@ -76,6 +92,7 @@ func New(ctx context.Context, cfg tauConfig.Config) (*Service, error) {
 	if err = srv.attachNodes(cfg); err != nil {
 		return nil, fmt.Errorf("attaching node services failed with: %w", err)
 	}
+	cfg.SetLocalHTTP(srv.components.http.ServeLocal)
 
 	if err = tbPlugins.Initialize(ctx, srv.components.config()...); err != nil {
 		return nil, fmt.Errorf("initializing Taubyte plugins failed with: %w", err)
@@ -131,6 +148,12 @@ func New(ctx context.Context, cfg tauConfig.Config) (*Service, error) {
 		return nil, fmt.Errorf("starting cpu check failed with: %w", err)
 	}
 
+	// Dream runs many nodes in one test process: exiting there would kill them all.
+	if !srv.dev {
+		startWatchdog(ctx, srv.probeLookup)
+		startStuckWatchdog(ctx, httpComp.StuckLookups)
+	}
+
 	return srv, nil
 }
 
@@ -164,7 +187,7 @@ func (s *Service) startCheckCpu() error {
 				// setting interval to greater than 0 will sleep for given interval duration
 				cpuUsage, err := cpu.Percent(CPUCheckInterval, false)
 				if err != nil {
-					logger.Errorf("checking cpu usage failed with: %w", err)
+					logger.Errorf("checking cpu usage failed with: %v", err)
 				}
 
 				s.cpuAverage = cpuUsage[0]
@@ -173,4 +196,16 @@ func (s *Service) startCheckCpu() error {
 	}()
 
 	return nil
+}
+
+// coLocatedServices returns the services other than substrate that run on
+// this node and so share its datastore.
+func coLocatedServices(services []string) []string {
+	others := make([]string, 0, len(services))
+	for _, s := range services {
+		if s != protocolCommon.Substrate {
+			others = append(others, s)
+		}
+	}
+	return others
 }

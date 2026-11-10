@@ -27,6 +27,7 @@ package kvdb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,6 +62,7 @@ const (
 	badShutdownKey    = "bs" // bad-shutdown: set on New, cleared on clean Close
 	versionKey        = "crdt_version"
 	reclaimNs         = "rc" // reclaim - receiver-side reclamation bookkeeping
+	unfinishedNs      = "uw" // unfinished walks, recorded on shutdown and resumed on start
 )
 
 // Common errors.
@@ -293,6 +295,11 @@ type dagJob struct {
 	node       ipld.Node       // the current ipld Node
 }
 
+type unfinishedWalk struct {
+	Root  Head
+	Block cid.Cid
+}
+
 type broadcastBatchHead struct {
 	head     Head
 	children []Head
@@ -423,11 +430,16 @@ func NewDatastore(
 		cancel()
 		return nil, err
 	}
-	dstore.logger.Infof(
+	logCreated := dstore.logger.Debugf
+	dirty := dstore.IsDirty(ctx)
+	if dirty {
+		logCreated = dstore.logger.Warnf
+	}
+	logCreated(
 		"crdt Datastore created. Number of heads: %d. Current max-height: %d. Dirty: %t",
 		len(headList),
 		maxHeight,
-		dstore.IsDirty(ctx),
+		dirty,
 	)
 
 	// sendJobWorker + NumWorkers
@@ -442,7 +454,11 @@ func NewDatastore(
 			dstore.dagWorker()
 		}()
 	}
-	dstore.wg.Add(5)
+	dstore.wg.Add(6)
+	go func() {
+		defer dstore.wg.Done()
+		dstore.resumeUnfinished(ctx)
+	}()
 	go func() {
 		defer dstore.wg.Done()
 		dstore.handleNext(ctx)
@@ -758,7 +774,7 @@ func (store *Datastore) repair(ctx context.Context) {
 			return
 		case <-timer.C:
 			if !store.IsDirty(ctx) {
-				store.logger.Info("store is marked clean. No need to repair")
+				store.logger.Debug("store is marked clean. No need to repair")
 			} else {
 				store.logger.Warn("store is marked dirty. Starting DAG repair operation")
 				err := store.repairDAG(ctx)
@@ -877,6 +893,7 @@ func (store *Datastore) dagWorker() {
 		select {
 		case <-ctx.Done():
 			// drain jobs from queue when we are done
+			store.recordUnfinished(job.root, job.node.Cid())
 			job.session.Done()
 			continue
 		default:
@@ -892,11 +909,18 @@ func (store *Datastore) dagWorker() {
 		)
 		if err != nil {
 			store.logger.Error(err)
-			store.MarkDirty(ctx)
+			if store.ctx.Err() != nil {
+				store.recordUnfinished(job.root, job.node.Cid())
+			} else {
+				store.MarkDirty(ctx)
+			}
 			job.session.Done()
 			continue
 		}
+		// Close must wait for this: it may still record unfinished children.
+		store.wg.Add(1)
 		go func(j *dagJob) {
+			defer store.wg.Done()
 			err := store.sendNewJobs(ctx, j.session, j.nodeGetter, j.root, children)
 			if err != nil {
 				store.logger.Error(err)
@@ -943,7 +967,7 @@ loop:
 		delta := store.newDelta()
 		err = delta.Unmarshal(deltaOpt.delta)
 		if err != nil {
-			store.logger.Warn("error unmarshaling children's delta: %s", err)
+			store.logger.Warnf("error unmarshaling children's delta: %s", err)
 			continue
 		}
 
@@ -963,6 +987,7 @@ loop:
 			session.Done()
 			// We are in the middle of sending jobs, thus we left
 			// something unprocessed.
+			delete(goodDeltas, deltaOpt.node.Cid())
 			err = ctx.Err()
 			break loop
 		}
@@ -977,9 +1002,75 @@ loop:
 		if _, ok := goodDeltas[child]; !ok {
 			store.logger.Warn("GetDeltas did not include all children")
 			store.queuedChildren.Remove(child)
+			// Checked on the store's context because boxo may report a
+			// cancelled GetMany as a plain "failed to fetch all nodes".
+			if store.ctx.Err() != nil {
+				store.recordUnfinished(root, child)
+				err = nil
+			}
 		}
 	}
 	return err
+}
+
+// recordUnfinished persists blocks whose walk a shutdown cut short. Their
+// parent is already processed, so handleBlock would skip the branch for good
+// and repairDAG cannot reach it unless a head sits above it: the next start
+// resumes from exactly here instead. A branch's own root has no processed
+// parent, and the broadcast that delivered it brings it back.
+func (store *Datastore) recordUnfinished(root Head, blocks ...cid.Cid) {
+	ctx := context.Background() // the store's context is already cancelled
+	for _, c := range blocks {
+		if c.Equals(root.Cid) {
+			continue
+		}
+		v, err := json.Marshal(unfinishedWalk{Root: root, Block: c})
+		if err == nil {
+			err = store.store.Put(ctx, store.unfinishedKey(c), v)
+		}
+		if err != nil {
+			store.logger.Errorf("error recording unfinished block %s: %s", c, err)
+			store.MarkDirty(ctx)
+		}
+	}
+}
+
+// resumeUnfinished continues the walks a previous shutdown recorded.
+func (store *Datastore) resumeUnfinished(ctx context.Context) {
+	results, err := store.store.Query(ctx, query.Query{Prefix: store.unfinishedPrefix().String()})
+	if err != nil {
+		store.logger.Errorf("error listing unfinished walks: %s", err)
+		store.MarkDirty(ctx)
+		return
+	}
+	entries, err := results.Rest()
+	if err != nil {
+		store.logger.Errorf("error listing unfinished walks: %s", err)
+		store.MarkDirty(ctx)
+		return
+	}
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		var w unfinishedWalk
+		if err := json.Unmarshal(e.Value, &w); err != nil {
+			store.logger.Errorf("error decoding unfinished walk: %s", err)
+			store.MarkDirty(ctx)
+			continue
+		}
+		// Deleted first so an interruption can re-record it: a clean stop
+		// does so above, a crash leaves the bad-shutdown key.
+		if err := store.store.Delete(ctx, ds.NewKey(e.Key)); err != nil {
+			store.logger.Errorf("error clearing unfinished walk: %s", err)
+			store.MarkDirty(ctx)
+			continue
+		}
+		if err := store.handleBranch(ctx, w.Root, w.Block); err != nil {
+			store.logger.Errorf("error resuming walk at %s: %s", w.Block, err)
+			store.MarkDirty(ctx)
+		}
+	}
 }
 
 // the only purpose of this worker is to be able to orderly shut-down job
@@ -1011,6 +1102,14 @@ func (store *Datastore) isProcessed(ctx context.Context, c cid.Cid) (bool, error
 
 func (store *Datastore) markProcessed(ctx context.Context, c cid.Cid) error {
 	return store.store.Put(ctx, store.processedBlockKey(c), nil)
+}
+
+func (store *Datastore) unfinishedPrefix() ds.Key {
+	return store.namespace.ChildString(unfinishedNs)
+}
+
+func (store *Datastore) unfinishedKey(c cid.Cid) ds.Key {
+	return store.unfinishedPrefix().ChildString(dshelp.MultihashToDsKey(c.Hash()).String())
 }
 
 func (store *Datastore) dirtyKey() ds.Key {
@@ -1196,6 +1295,15 @@ func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, roo
 	return children, nil
 }
 
+// The repair walk reads every block in history, cold, while the node serves
+// traffic. It idles this many times as long as each step took, so it stays a
+// background job at any DAG size; capped so a long real reprocess of a broken
+// branch does not stall the walk.
+const (
+	repairIdleFactor = 4
+	repairMaxIdle    = 100 * time.Millisecond
+)
+
 // RepairDAG is used to walk down the chain until a non-processed node is
 // found and at that moment, queues it for processing.
 func (store *Datastore) repairDAG(ctx context.Context) error {
@@ -1248,6 +1356,7 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		}
 	}()
 
+	stepStart := time.Now()
 	for {
 		// GetDelta does not seem to respond well to context
 		// cancellations (probably this goes down to the Blockstore
@@ -1256,8 +1365,9 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		default:
+		case <-time.After(min(repairIdleFactor*time.Since(stepStart), repairMaxIdle)):
 		}
+		stepStart = time.Now()
 
 		if len(nodes) == 0 {
 			break
@@ -1453,6 +1563,11 @@ func (store *Datastore) Close() error {
 	store.wg.Wait()
 	if store.IsDirty(closeCtx) {
 		store.logger.Warn("datastore is being closed marked as dirty")
+	}
+	// Unfinished walks must reach disk before the bad-shutdown key clears.
+	if err := store.store.Sync(closeCtx, store.unfinishedPrefix()); err != nil {
+		store.logger.Errorf("error syncing unfinished walks, leaving the bad-shutdown key: %s", err)
+		return nil
 	}
 	// Clear the bad-shutdown key last, after all workers have exited, so
 	// any dirty marks they still needed to write have had a chance to

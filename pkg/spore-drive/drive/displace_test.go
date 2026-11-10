@@ -226,25 +226,47 @@ func testDisplace(t *testing.T, sd Spore) {
 			assert.NilError(t, err)
 			f.Close()
 			assert.Equal(t, string(data), `[Unit]
-Description = Taubyte Tau Service Running %i
+Description           = Taubyte Tau Service Running %i
+StartLimitIntervalSec = 0
 
 [Service]
-Type           = simple
-ExecStartPre   = -/usr/sbin/setenforce 0
-ExecStart      = /tb/bin/tau start -s %i --root /tb
-StandardOutput = journal
-User           = root
-Group          = root
-LimitAS        = infinity
-LimitRSS       = infinity
-LimitCORE      = infinity
-LimitNOFILE    = 65536
-Restart        = always
-RestartSec     = 1
+Type                     = simple
+ExecStartPre             = -/usr/sbin/setenforce 0
+ExecStart                = /tb/bin/tau start -s %i --root /tb
+StandardOutput           = journal
+User                     = root
+Group                    = root
+LimitAS                  = infinity
+LimitRSS                 = infinity
+LimitCORE                = infinity
+LimitNOFILE              = 65536
+Restart                  = always
+RestartSec               = 1
+RestartPreventExitStatus = 78
 
 [Install]
 WantedBy = multi-user.target
 `)
 		}
 	}
+}
+
+func TestDisplaceWithoutTenancy(t *testing.T) {
+	_, p := fixtures.VirtConfig()
+	assert.NilError(t, p.Tenancy().SetOwner(""))
+	sd, err := New(p)
+	assert.NilError(t, err)
+	sd.(*sporedrive).hostWrapper = func(context.Context, host.Host) (remoteHost, error) {
+		t.Fatal("host contacted without tenancy")
+		return nil, nil
+	}
+	c, err := course.New(sd.Network(), course.Shapes("shape1"))
+	assert.NilError(t, err)
+	var got error
+	for pr := range sd.Displace(context.Background(), c) {
+		if pr.Error() != nil {
+			got = pr.Error()
+		}
+	}
+	assert.ErrorContains(t, got, "no tenancy configured")
 }

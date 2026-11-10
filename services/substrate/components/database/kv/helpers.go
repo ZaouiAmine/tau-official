@@ -19,23 +19,19 @@ func (kv *kv) used(ctx context.Context) (int, error) {
 			return 0, fmt.Errorf("getting Size for key %s failed with %w", key, err)
 		}
 
-		size, err := strconv.Atoi(string(sizeByte))
-		if err != nil {
-			return 0, fmt.Errorf("failed converting byte to int %s failed with %w", key, err)
+		// A user key under size/ can hold anything; it is not a size record.
+		if size, err := strconv.Atoi(string(sizeByte)); err == nil {
+			used += size
 		}
-
-		used += int(size)
 	}
 	return used, nil
 }
 
-func (kv *kv) checkValidSize(ctx context.Context, input []byte) error {
+func (kv *kv) checkValidSize(ctx context.Context, inputSize int) error {
 	used, err := kv.used(ctx)
 	if err != nil {
 		return fmt.Errorf("getting usage for in kvdb failed with %w", err)
 	}
-
-	inputSize := len(input)
 
 	if kv.maxSize < uint64(used+inputSize) {
 		return fmt.Errorf("no space left for input")

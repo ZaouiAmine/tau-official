@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"errors"
+	goHttp "net/http"
 	"regexp"
 	"sync"
 
@@ -22,6 +23,10 @@ var (
 	DefaultP2PListenFormat = "/ip4/0.0.0.0/tcp/%d"
 	DefaultHTTPListen      = "0.0.0.0:443"
 )
+
+// LocalHTTP serves a request on the substrate in this process. handled is false
+// when nothing ran and nothing was written, so another node may take the request.
+type LocalHTTP func(w goHttp.ResponseWriter, r *goHttp.Request) (handled bool, err error)
 
 // Config is the validated node configuration. Created via New; mutable fields can be set by bootstrap (e.g. SetNode, SetRaftCluster).
 type Config interface {
@@ -60,6 +65,7 @@ type Config interface {
 	Databases() kvdb.Factory
 	RaftCluster() raft.Cluster
 	ClientNode() peer.Node
+	LocalHTTP() LocalHTTP
 	SwarmKey() []byte
 	Http() http.Service
 	Sensors() *sensors.Service
@@ -71,10 +77,13 @@ type Config interface {
 	SensorsRegistry() *sensors.Registry
 	Accounts() Accounts
 	Tenancy() Tenancy
+	Substrate() Substrate
+	Quotas() Quotas
 
 	SetNode(peer.Node)
 	SetRaftCluster(raft.Cluster)
 	SetClientNode(peer.Node)
+	SetLocalHTTP(LocalHTTP)
 	SetDatabases(kvdb.Factory)
 	SetHttp(http.Service)
 	SetSensors(*sensors.Service)
@@ -351,6 +360,7 @@ type config struct {
 	databases        kvdb.Factory
 	raftCluster      raft.Cluster
 	clientNode       peer.Node
+	localHTTP        LocalHTTP
 	swarmKey         []byte
 	http             http.Service
 	sensors          *sensors.Service
@@ -361,6 +371,8 @@ type config struct {
 	domainValidation DomainValidation
 	accounts         Accounts
 	tenancy          Tenancy
+	substrate        Substrate
+	quotas           Quotas
 	// enterprise namespaces raw config for enterprise-only services (each decoded
 	// by //go:build ee code via EnterpriseConfig); empty in community builds.
 	enterprise map[string]yaml.Node
@@ -466,6 +478,7 @@ func (c *config) PrivateKey() []byte                 { return c.privateKey }
 func (c *config) Databases() kvdb.Factory            { return c.databases }
 func (c *config) RaftCluster() raft.Cluster          { return c.raftCluster }
 func (c *config) ClientNode() peer.Node              { return c.clientNode }
+func (c *config) LocalHTTP() LocalHTTP               { return c.localHTTP }
 func (c *config) SwarmKey() []byte                   { return c.swarmKey }
 func (c *config) Http() http.Service                 { return c.http }
 func (c *config) Sensors() *sensors.Service          { return c.sensors }
@@ -476,10 +489,13 @@ func (c *config) Plugins() Plugins                   { return c.plugins }
 func (c *config) DomainValidation() DomainValidation { return c.domainValidation }
 func (c *config) Accounts() Accounts                 { return c.accounts }
 func (c *config) Tenancy() Tenancy                   { return c.tenancy }
+func (c *config) Substrate() Substrate               { return c.substrate }
+func (c *config) Quotas() Quotas                     { return c.quotas }
 
 func (c *config) SetNode(n peer.Node)            { c.node = n }
 func (c *config) SetRaftCluster(rc raft.Cluster) { c.raftCluster = rc }
 func (c *config) SetClientNode(n peer.Node)      { c.clientNode = n }
+func (c *config) SetLocalHTTP(h LocalHTTP)       { c.localHTTP = h }
 func (c *config) SetDatabases(db kvdb.Factory)   { c.databases = db }
 func (c *config) SetHttp(h http.Service)         { c.http = h }
 func (c *config) SetSensors(s *sensors.Service)  { c.sensors = s }

@@ -1,25 +1,26 @@
 package args
 
 import (
-	slices "github.com/taubyte/tau/utils/slices/string"
+	"strings"
+
 	"github.com/urfave/cli/v2"
 )
 
-func parseCommandArguments(commands []*cli.Command, args ...string) []string {
+func parseCommandArguments(commands []*cli.Command, valued map[string]bool, args ...string) []string {
 	if len(args) == 1 || len(commands) == 0 {
 		return args
 	}
 	// We need to also parse sub commands
-	for _, cmd := range commands {
-		if slices.Contains(args, cmd.Name) {
+	if cmd, _, _ := leftmost(args, commands, valued); cmd != nil {
+		{
 			// parse arguments after cmd.Name so that `login testprofile -provider github` becomes `login -provider github testprofile`
 			// and `login -provider github testprofile` becomes `login -provider github testprofile`
-			idx := IndexOf(args, cmd.Name)
+			idx := commandIndex(args, cmd.Name, valued)
 
 			// Check aliases
 			if idx == -1 {
 				for _, alias := range cmd.Aliases {
-					idx = IndexOf(args, alias)
+					idx = commandIndex(args, alias, valued)
 					if idx != -1 {
 						break
 					}
@@ -33,10 +34,10 @@ func parseCommandArguments(commands []*cli.Command, args ...string) []string {
 
 			if len(cmd.Subcommands) > 0 {
 				for _, sCmd := range cmd.Subcommands {
-					sIdx := IndexOf(args, sCmd.Name)
+					sIdx := commandIndex(args, sCmd.Name, valued)
 					if sIdx == -1 {
 						for _, alias := range sCmd.Aliases {
-							sIdx = IndexOf(args, alias)
+							sIdx = commandIndex(args, alias, valued)
 							if sIdx != -1 {
 								break
 							}
@@ -62,8 +63,10 @@ func ParseArguments(globalFlags []cli.Flag, commands []*cli.Command, args ...str
 		return args
 	}
 
+	valued := valueFlags(globalFlags, commands)
+
 	// Move commands without the program name
-	args = append(args[:1], MovePostFixCommands(args[1:], commands)...)
+	args = append(args[:1], moveCommands(args[1:], commands, valued)...)
 
 	validGlobalFlags := ParseFlags(globalFlags)
 	argsWithGlobalsMoved := MovePostfixOptions(args, validGlobalFlags)
@@ -76,55 +79,104 @@ func ParseArguments(globalFlags []cli.Flag, commands []*cli.Command, args ...str
 		validCommands[idx] = command.Name
 	}
 
-	for idx, arg := range argsWithGlobalsMoved[1:] {
-		if commandStartIdx != 0 {
-			break
-		}
-
-		for _, cmd := range validCommands {
-			if arg == cmd {
-				commandStartIdx = idx + 1 // We do +1 because we start at 1:
-				break
-			}
+	for _, cmd := range validCommands {
+		// +1 because the program name is not searched
+		if idx := commandIndex(argsWithGlobalsMoved[1:], cmd, valued); idx != -1 && (commandStartIdx == 0 || idx+1 < commandStartIdx) {
+			commandStartIdx = idx + 1
 		}
 	}
 
-	commandArgs := parseCommandArguments(commands, argsWithGlobalsMoved[commandStartIdx:]...)
+	commandArgs := parseCommandArguments(commands, valued, argsWithGlobalsMoved[commandStartIdx:]...)
 
 	return append(argsWithGlobalsMoved[:commandStartIdx], commandArgs...)
 }
 
 // Places the command being called at the beginning of the args slice for parsing
 func MovePostFixCommands(args []string, commands []*cli.Command) []string {
-	// find which command is being called
-	cmd_args := []string{}
+	return moveCommands(args, commands, valueFlags(nil, commands))
+}
 
-	for _, cmd := range commands {
-		argName := cmd.Name
-		idx := IndexOf(args, argName)
-		if idx == -1 {
-			for _, alias := range cmd.Aliases {
-				idx = IndexOf(args, alias)
-				if idx != -1 {
-					argName = alias
-					break
+func moveCommands(args []string, commands []*cli.Command, valued map[string]bool) []string {
+	// one command is called per level: the leftmost word naming one, so in
+	// `query logs` the top-level `logs` command is not also picked
+	cmd, argName, idx := leftmost(args, commands, valued)
+	if cmd == nil {
+		return args
+	}
+
+	// move argName to the front, then its subcommand
+	args = append(args[:idx:idx], args[idx+1:]...)
+	if len(cmd.Subcommands) > 0 {
+		args = moveCommands(args, cmd.Subcommands, valued)
+	}
+	return append([]string{argName}, args...)
+}
+
+// leftmost is the command (and the name or alias used) named first in args.
+func leftmost(args []string, commands []*cli.Command, valued map[string]bool) (cmd *cli.Command, argName string, idx int) {
+	idx = -1
+	for _, c := range commands {
+		for _, name := range append([]string{c.Name}, c.Aliases...) {
+			if i := commandIndex(args, name, valued); i != -1 && (idx == -1 || i < idx) {
+				cmd, argName, idx = c, name, i
+			}
+		}
+	}
+	return
+}
+
+// valueFlags returns the names of the flags that take a value wherever they
+// appear in the command tree. A name that takes a value in one command and none
+// in another (push --code, import --code VALUE) is left out: the word after it
+// is not known to be its value, and arguments are read as they always were.
+func valueFlags(global []cli.Flag, commands []*cli.Command) map[string]bool {
+	valued := make(map[string]bool)
+	boolean := make(map[string]bool)
+	add := func(flags []cli.Flag) {
+		for _, f := range flags {
+			takes := false
+			if d, ok := f.(cli.DocGenerationFlag); ok {
+				takes = d.TakesValue()
+			}
+			for _, name := range f.Names() {
+				if takes {
+					valued[name] = true
+				} else {
+					boolean[name] = true
 				}
 			}
 		}
-		if idx == -1 {
-			continue
-		}
-
-		// remove argName from args
-		args = append(args[:idx], args[idx+1:]...)
-
-		// add argName to cmd_args
-		cmd_args = append(cmd_args, argName)
-
-		if len(cmd.Subcommands) > 0 {
-			args = MovePostFixCommands(args, cmd.Subcommands)
+	}
+	var walk func([]*cli.Command)
+	walk = func(cmds []*cli.Command) {
+		for _, c := range cmds {
+			add(c.Flags)
+			walk(c.Subcommands)
 		}
 	}
+	add(global)
+	walk(commands)
+	for name := range boolean {
+		delete(valued, name)
+	}
+	return valued
+}
 
-	return append(cmd_args, args...)
+// commandIndex finds name among args as a word of its own, so not as the value
+// of a flag: in `push project -m cancel`, cancel is a commit message.
+func commandIndex(args []string, name string, valued map[string]bool) int {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			flag := strings.TrimLeft(arg, "-")
+			if !strings.Contains(flag, "=") && valued[flag] {
+				i++
+			}
+			continue
+		}
+		if arg == name {
+			return i
+		}
+	}
+	return -1
 }

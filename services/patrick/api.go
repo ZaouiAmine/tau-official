@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -92,12 +94,15 @@ func (p *PatrickService) requestServiceHandler(ctx context.Context, conn streams
 		return p.dequeueHandler(ctx, conn)
 	case "isAssigned":
 		return p.isAssignedHandler(ctx, jid, conn)
+	case "refresh":
+		return p.refreshHandler(ctx, jid, conn)
 	case "cancel":
 		return cr.Response{"cancelled": jid}, p.cancelHandler(ctx, jid, cidMap)
 	case "done":
 		return nil, p.doneHandler(ctx, jid, cidMap, assetMap, conn)
 	case "failed":
-		return nil, p.failedHandler(ctx, jid, cidMap, assetMap, conn)
+		reason, _ := body["reason"].(string)
+		return nil, p.failedHandler(ctx, jid, cidMap, assetMap, reason, conn)
 	case "timeout":
 		return nil, p.timeoutHandler(ctx, jid, cidMap)
 	case "hasJob":
@@ -164,14 +169,6 @@ func (p *PatrickService) infoHandler(ctx context.Context, jid string) (cr.Respon
 
 // dequeueHandler pops the next job from the queue, records the assignment, and returns the job.
 func (p *PatrickService) dequeueHandler(ctx context.Context, conn streams.Connection) (cr.Response, error) {
-	id, _, err := p.jobQueue.Pop(5 * time.Second)
-	if err != nil {
-		if errors.Is(err, raft.ErrQueueEmpty) {
-			return cr.Response{"available": false}, nil
-		}
-		return nil, fmt.Errorf("queue pop: %w", err)
-	}
-
 	// The job is already popped from the raft queue, so it must be fully
 	// assigned or it is stranded (popped-but-unassigned) until ReAnnounce
 	// re-homes it — a slow, avoidable round-trip. The pop is destructive, so
@@ -181,42 +178,109 @@ func (p *PatrickService) dequeueHandler(ctx context.Context, conn streams.Connec
 	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancel()
 
-	job, err := p.getJob(opCtx, "/jobs/", id)
+	// Jobs of a project at its build cap are skipped and go back on the queue.
+	var skipped []string
+	defer func() {
+		for _, id := range skipped {
+			if err := p.enqueue(id); err != nil {
+				logger.Errorf("requeue %s over its project's build cap: %s", id, err)
+			}
+		}
+	}()
+
+	quotas, capsOn := p.buildCaps()
+	if capsOn {
+		// counting running builds and writing the claim must be one step, or
+		// concurrent dequeues all see the same count and overshoot the cap
+		p.claimLock.Lock()
+		defer p.claimLock.Unlock()
+	}
+	var running map[string]int
+	for len(skipped) < maxCappedSkips {
+		id, _, err := p.jobQueue.Pop(5 * time.Second)
+		if err != nil {
+			// A follower cannot pop, and removes nothing trying: it has no job to
+			// give, which is an answer, not a failure. The monkey asks the next
+			// Patrick, and the leader hands the job out.
+			if errors.Is(err, raft.ErrQueueEmpty) || errors.Is(err, raft.ErrNotLeader) {
+				return cr.Response{"available": false}, nil
+			}
+			return nil, fmt.Errorf("queue pop: %w", err)
+		}
+
+		job, err := p.getJob(opCtx, "/jobs/", id)
+		if err != nil {
+			return nil, fmt.Errorf("get job %s after pop: %w", id, err)
+		}
+
+		var project string
+		if capsOn {
+			project = p.projectOf(job)
+			if running == nil {
+				running = p.runningBuilds(opCtx, id)
+			}
+			if c := quotas.For(project).Builds; project != "" && c > 0 && running[project] >= c {
+				skipped = append(skipped, id)
+				continue
+			}
+		}
+
+		assignData, err := cbor.Marshal(Assignment{
+			MonkeyPID: conn.RemotePeer().String(),
+			Timestamp: time.Now().Unix(),
+			Project:   project,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal assignment: %w", err)
+		}
+		if err := p.db.Put(opCtx, "/assigned/"+id, assignData); err != nil {
+			return nil, fmt.Errorf("record assignment for %s: %w", id, err)
+		}
+		p.projects.Delete(id)
+		return cr.Response{"available": true, "job": job}, nil
+	}
+	return cr.Response{"available": false}, nil
+}
+
+// callerAssignment returns the job's claim if the calling Monkey holds it, nil otherwise.
+func (p *PatrickService) callerAssignment(ctx context.Context, jid string, conn streams.Connection) *Assignment {
+	data, err := p.db.Get(ctx, "/assigned/"+jid)
 	if err != nil {
-		return nil, fmt.Errorf("get job %s after pop: %w", id, err)
+		return nil
 	}
 
-	monkeyPID := conn.RemotePeer()
-	assignment := Assignment{
-		MonkeyPID: monkeyPID.String(),
-		Timestamp: time.Now().Unix(),
+	var assignment Assignment
+	if err := cbor.Unmarshal(data, &assignment); err != nil || assignment.MonkeyPID != conn.RemotePeer().String() {
+		return nil
 	}
+
+	return &assignment
+}
+
+// isAssignedHandler checks whether the calling Monkey is still the assigned owner of the job.
+func (p *PatrickService) isAssignedHandler(ctx context.Context, jid string, conn streams.Connection) (cr.Response, error) {
+	return cr.Response{"assigned": p.callerAssignment(ctx, jid, conn) != nil}, nil
+}
+
+// refreshHandler renews the calling Monkey's claim on the job, so re-announce
+// does not hand it to another Monkey. Another Monkey's claim is left as is.
+func (p *PatrickService) refreshHandler(ctx context.Context, jid string, conn streams.Connection) (cr.Response, error) {
+	assignment := p.callerAssignment(ctx, jid, conn)
+	if assignment == nil {
+		return cr.Response{"assigned": false}, nil
+	}
+
+	assignment.Timestamp = time.Now().Unix()
 	assignData, err := cbor.Marshal(assignment)
 	if err != nil {
 		return nil, fmt.Errorf("marshal assignment: %w", err)
 	}
 
-	if err := p.db.Put(opCtx, "/assigned/"+id, assignData); err != nil {
-		return nil, fmt.Errorf("record assignment for %s: %w", id, err)
+	if err := p.db.Put(ctx, "/assigned/"+jid, assignData); err != nil {
+		return nil, fmt.Errorf("refresh assignment for %s: %w", jid, err)
 	}
 
-	return cr.Response{"available": true, "job": job}, nil
-}
-
-// isAssignedHandler checks whether the calling Monkey is still the assigned owner of the job.
-func (p *PatrickService) isAssignedHandler(ctx context.Context, jid string, conn streams.Connection) (cr.Response, error) {
-	data, err := p.db.Get(ctx, "/assigned/"+jid)
-	if err != nil {
-		return cr.Response{"assigned": false}, nil
-	}
-
-	var assignment Assignment
-	if err := cbor.Unmarshal(data, &assignment); err != nil {
-		return cr.Response{"assigned": false}, nil
-	}
-
-	isAssigned := assignment.MonkeyPID == conn.RemotePeer().String()
-	return cr.Response{"assigned": isAssigned}, nil
+	return cr.Response{"assigned": true}, nil
 }
 
 func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log map[string]string) error {
@@ -229,6 +293,9 @@ func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log
 		if job.Attempt == servicesCommon.MaxJobAttempts {
 			job.Status = commonIface.JobStatusFailed
 			job.Logs = cid_log
+			if err := p.recordLogOwner(ctx, jid, cid_log); err != nil {
+				return fmt.Errorf("recording owners of job %s logs failed with %w", jid, err)
+			}
 
 			jobData, err := cbor.Marshal(job)
 			if err != nil {
@@ -265,7 +332,7 @@ func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log
 			return err
 		}
 
-		if err = p.jobQueue.Push(jid, nil, 5*time.Second); err != nil {
+		if err = p.enqueue(jid); err != nil {
 			return fmt.Errorf("failed to push job %s back onto queue: %w", jid, err)
 		}
 
@@ -276,15 +343,15 @@ func (p *PatrickService) timeoutHandler(ctx context.Context, jid string, cid_log
 }
 
 func (p *PatrickService) doneHandler(ctx context.Context, jid string, cid_log map[string]string, assetCid map[string]string, conn streams.Connection) error {
-	return p.updateStatus(ctx, conn.RemotePeer(), jid, cid_log, commonIface.JobStatusSuccess, assetCid)
+	return p.updateStatus(ctx, conn.RemotePeer(), jid, cid_log, commonIface.JobStatusSuccess, assetCid, "")
 }
 
-func (p *PatrickService) failedHandler(ctx context.Context, jid string, cid_log map[string]string, assetCid map[string]string, conn streams.Connection) error {
-	return p.updateStatus(ctx, conn.RemotePeer(), jid, cid_log, commonIface.JobStatusFailed, assetCid)
+func (p *PatrickService) failedHandler(ctx context.Context, jid string, cid_log map[string]string, assetCid map[string]string, reason string, conn streams.Connection) error {
+	return p.updateStatus(ctx, conn.RemotePeer(), jid, cid_log, commonIface.JobStatusFailed, assetCid, reason)
 }
 
 func (p *PatrickService) cancelHandler(ctx context.Context, jid string, cid_log map[string]string) error {
-	return p.updateStatus(ctx, "", jid, cid_log, commonIface.JobStatusCancelled, nil)
+	return p.updateStatus(ctx, "", jid, cid_log, commonIface.JobStatusCancelled, nil, "")
 }
 
 func (p *PatrickService) deleteJob(ctx context.Context, jid string, loc ...string) error {
@@ -297,7 +364,7 @@ func (p *PatrickService) deleteJob(ctx context.Context, jid string, loc ...strin
 	return nil
 }
 
-func (p *PatrickService) updateStatus(ctx context.Context, pid peer.ID, jid string, cid_log map[string]string, status commonIface.JobStatus, assetCid map[string]string) error {
+func (p *PatrickService) updateStatus(ctx context.Context, pid peer.ID, jid string, cid_log map[string]string, status commonIface.JobStatus, assetCid map[string]string, reason string) error {
 	if pid != "" {
 		data, err := p.db.Get(ctx, "/assigned/"+jid)
 		if err == nil {
@@ -320,7 +387,18 @@ func (p *PatrickService) updateStatus(ctx context.Context, pid peer.ID, jid stri
 	if job.Status != commonIface.JobStatusCancelled {
 		job.Logs = cid_log
 		job.AssetCid = assetCid
+		job.Reason = reason
 		job.Attempt++
+		if err := p.recordLogOwner(ctx, jid, cid_log); err != nil {
+			return fmt.Errorf("recording owners of job %s logs failed with %w", jid, err)
+		}
+	}
+
+	lastTry := reason != "" || job.Attempt >= servicesCommon.MaxJobAttempts
+
+	// not the job's last try: it runs again, so it is open, as after a timeout
+	if job.Status == commonIface.JobStatusFailed && !lastTry {
+		job.Status = commonIface.JobStatusOpen
 	}
 
 	jobData, err := cbor.Marshal(job)
@@ -328,11 +406,12 @@ func (p *PatrickService) updateStatus(ctx context.Context, pid peer.ID, jid stri
 		return fmt.Errorf("marshal in updateStatus error: %w", err)
 	}
 
-	if job.Status == commonIface.JobStatusSuccess || job.Status == commonIface.JobStatusCancelled || job.Attempt >= servicesCommon.MaxJobAttempts {
-		p.deleteJob(ctx, jid, "/jobs/")
+	if job.Status == commonIface.JobStatusSuccess || job.Status == commonIface.JobStatusCancelled || lastTry {
+		// archived first, so a job is always in one place or the other
 		if err = p.db.Put(ctx, "/archive/jobs/"+jid, jobData); err != nil {
 			return fmt.Errorf("updateStatus put failed with error: %w", err)
 		}
+		p.deleteJob(ctx, jid, "/jobs/")
 	} else {
 		if err = p.db.Put(ctx, "/jobs/"+jid, jobData); err != nil {
 			return fmt.Errorf("updateStatus put failed with error: %w", err)
@@ -384,12 +463,33 @@ func (srv *PatrickService) projectAllJobHandler(ctx http.Context) (interface{}, 
 		jids[idx] = strings.TrimPrefix(jobKey, prefix)
 	}
 
+	// ?last=N: the N most recent, newest first, so a client fetches only those
+	if last, err := strconv.Atoi(ctx.Request().URL.Query().Get("last")); err == nil && last > 0 {
+		jids = srv.newestJobs(ctx.Request().Context(), jids, last)
+	}
+
 	data := project{
 		ProjectId: projectId,
 		JobIds:    jids,
 	}
 
 	return data, nil
+}
+
+// newestJobs orders jobs newest first and keeps last of them. A job that cannot
+// be read sorts as oldest.
+func (srv *PatrickService) newestJobs(ctx context.Context, jids []string, last int) []string {
+	stamps := make(map[string]int64, len(jids))
+	for _, jid := range jids {
+		if job, err := srv.anyJob(ctx, jid); err == nil {
+			stamps[jid] = job.Timestamp
+		}
+	}
+	sort.SliceStable(jids, func(i, j int) bool { return stamps[jids[i]] > stamps[jids[j]] })
+	if len(jids) > last {
+		jids = jids[:last]
+	}
+	return jids
 }
 
 func (srv *PatrickService) projectJobHandler(ctx http.Context) (iface interface{}, err error) {
@@ -514,9 +614,10 @@ func (srv *PatrickService) retryJob(ctx http.Context) (iface interface{}, err er
 	if job.Status == commonIface.JobStatusCancelled || job.Status == commonIface.JobStatusFailed || job.Status == commonIface.JobStatusSuccess {
 		job.Status = commonIface.JobStatusOpen
 		job.Attempt = 0
+		job.Reason = ""
 		job_byte, err := cbor.Marshal(job)
 		if err != nil {
-			logger.Errorf("failed cbor marshall on job %s with err: %w", job.Id, err)
+			logger.Errorf("failed cbor marshall on job %s with err: %v", job.Id, err)
 			return nil, fmt.Errorf("failed marshalling job %s with err %w", job.Id, err)
 		}
 
@@ -525,13 +626,18 @@ func (srv *PatrickService) retryJob(ctx http.Context) (iface interface{}, err er
 			return nil, fmt.Errorf("failed deleting job %s with error: %w", jid, err)
 		}
 
+		// its next run writes a new log from the start
+		if srv.liveLogs != nil {
+			srv.liveLogs.reset(job.Id)
+		}
+
 		err = srv.db.Put(requestCtx, "/jobs/"+job.Id, job_byte)
 		if err != nil {
 			logger.Errorf("failed putting job %s into database with error: %s", job.Id, err.Error())
 			return nil, fmt.Errorf("failed putting job %s with %w", job.Id, err)
 		}
 
-		if err = srv.jobQueue.Push(job.Id, nil, 5*time.Second); err != nil {
+		if err = srv.enqueue(job.Id); err != nil {
 			return nil, fmt.Errorf("failed to push retried job %s onto queue: %w", job.Id, err)
 		}
 
@@ -658,7 +764,20 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.projectAllJobHandler,
+		Handler: srv.withProjectAccess(srv.onlyReadableJobs(srv.projectAllJobHandler)),
+	})
+
+	srv.http.GET(&http.RouteDefinition{
+		Hosts: hosts,
+		Path:  "/usage/{projectId}",
+		Vars: http.Variables{
+			Required: []string{"projectId"},
+		},
+		Auth: http.RouteAuthHandler{
+			Validator: srv.GitHubTokenHTTPAuth,
+			GC:        srv.GitHubTokenHTTPAuthCleanup,
+		},
+		Handler: srv.withProjectAccess(srv.usageHandler),
 	})
 
 	srv.http.GET(&http.RouteDefinition{
@@ -671,7 +790,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.projectJobHandler,
+		Handler: srv.withJobAccess("jid", srv.projectJobHandler),
 	})
 
 	srv.http.GET(&http.RouteDefinition{
@@ -680,7 +799,11 @@ func (srv *PatrickService) setupJobRoutes() {
 		Vars: http.Variables{
 			Required: []string{"jobId", "resourceId"},
 		},
-		Handler:     srv.downloadAsset,
+		Auth: http.RouteAuthHandler{
+			Validator: srv.GitHubTokenHTTPAuth,
+			GC:        srv.GitHubTokenHTTPAuthCleanup,
+		},
+		Handler:     srv.withJobAccess("jobId", srv.downloadAsset),
 		RawResponse: true,
 	})
 
@@ -694,8 +817,21 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler:     srv.cidHandler,
+		Handler:     srv.withLogAccess(srv.cidHandler),
 		RawResponse: true,
+	})
+
+	srv.http.WebSocket(&http.WebSocketDefinition{
+		Hosts: hosts,
+		Path:  "/stream/logs/{jid}",
+		Vars: http.Variables{
+			Required: []string{"jid"},
+		},
+		Auth: http.RouteAuthHandler{
+			Validator: srv.GitHubTokenHTTPAuth,
+			GC:        srv.GitHubTokenHTTPAuthCleanup,
+		},
+		NewHandler: srv.newLogStream,
 	})
 
 	srv.http.POST(&http.RouteDefinition{
@@ -708,7 +844,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.cancelJob,
+		Handler: srv.withJobAccess("jid", srv.cancelJob),
 	})
 
 	srv.http.POST(&http.RouteDefinition{
@@ -721,7 +857,7 @@ func (srv *PatrickService) setupJobRoutes() {
 			Validator: srv.GitHubTokenHTTPAuth,
 			GC:        srv.GitHubTokenHTTPAuthCleanup,
 		},
-		Handler: srv.retryJob,
+		Handler: srv.withJobAccess("jid", srv.retryJob),
 	})
 
 }
@@ -737,7 +873,7 @@ func (srv *PatrickService) GitHubTokenHTTPAuth(ctx http.Context) (interface{}, e
 		}
 		ctx.SetVariable("GithubClient", client)
 		ctx.SetVariable("GithubClientDone", rctx_cancel)
-		logger.Debugf("[GitHubTokenHTTPAuth] ctx=%v", ctx.Variables())
+		logger.Debugf("[GitHubTokenHTTPAuth] %s", ctx.Request().URL.Path) // never the variables: they hold the token
 		return nil, nil
 	}
 	return nil, errors.New("valid Github token required")

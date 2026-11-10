@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	patrickClient "github.com/taubyte/tau/clients/p2p/patrick"
@@ -27,6 +28,9 @@ var NewPatrick = func(ctx context.Context, node peer.Node) (patrick.Client, erro
 var _ iface.Service = &Service{}
 
 type Monkey struct {
+	// liveLogWarned keeps one Warn per job when its live log cannot be sent.
+	liveLogWarned atomic.Bool
+
 	ctx     context.Context
 	ctxC    context.CancelFunc
 	Id      string
@@ -39,6 +43,8 @@ type Monkey struct {
 	start time.Time
 
 	generatedDomainRegExp *regexp.Regexp
+
+	failReason string // set when another run would fail the same way
 }
 
 type Service struct {
@@ -80,6 +86,11 @@ func (s *Service) Delete(jid string) {
 
 func (s *Service) Node() peer.Node {
 	return s.node
+}
+
+// Caps returns the operator's caps for a project.
+func (s *Service) Caps(projectID string) config.Caps {
+	return s.config.Quotas().For(projectID)
 }
 
 func (s *Service) Dev() bool {

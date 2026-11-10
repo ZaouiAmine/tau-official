@@ -115,11 +115,13 @@ func (f *factory) New(logger logging.StandardLogger, path string, rebroadcastInt
 
 	opts.RebroadcastInterval = time.Duration(rebroadcastIntervalSec * int(time.Second))
 	opts.PutHook = func(k ds.Key, v []byte) {
-		logger.Infof("Added: [%s] -> %s\n", k, string(v))
+		logger.Debug(putLogLine(k, v))
+		s.changed(k.String())
 	}
 
 	opts.DeleteHook = func(k ds.Key) {
-		logger.Infof("Removed: [%s]\n", k)
+		logger.Debugf("Removed: [%s]", k)
+		s.changed(k.String())
 	}
 
 	s.datastore, err = NewDatastore(f.node.Store(), ds.NewKey("crdt/"+path), f.node.DAG(), s.broadcaster, opts)
@@ -136,4 +138,14 @@ func (f *factory) New(logger logging.StandardLogger, path string, rebroadcastInt
 
 func (k *kvDatabase) Factory() kvdb.Factory {
 	return k.factory
+}
+
+// OnChange calls f with every key this node's copy puts or removes, written
+// here or replicated from a peer. f must not block.
+func (k *kvDatabase) OnChange(f func(key string)) { k.onChange.Store(f) }
+
+func (k *kvDatabase) changed(key string) {
+	if f, ok := k.onChange.Load().(func(string)); ok {
+		f(key)
+	}
 }

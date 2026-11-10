@@ -42,6 +42,14 @@ type Context struct {
 	// NetworkFqdn is the cloud FQDN this monkey is compiling for. Empty in
 	// dream/local; WithCloud is a no-op when empty.
 	NetworkFqdn string
+
+	// reuseKey is what a website or library build is recorded under once
+	// published, so the next job with the same sources reuses it.
+	reuseKey string
+
+	// unlocks release the project clone dirs this job holds. A pointer, so the
+	// handler's copy of the Context (see Handler) adds to the list Run releases.
+	unlocks *[]func()
 }
 
 type Op struct {
@@ -61,16 +69,19 @@ type repo interface {
 	handle() error
 }
 
-func (c Context) Handler() (repo, error) {
+func (c *Context) Handler() (repo, error) {
+	if c.unlocks == nil {
+		c.unlocks = new([]func())
+	}
 	switch c.RepoType {
 	case repositorytype.ConfigRepository:
-		return &config{c}, nil
+		return &config{*c}, nil
 	case repositorytype.CodeRepository:
-		return &code{c}, nil
+		return &code{*c}, nil
 	case repositorytype.LibraryRepository:
-		return &library{c}, nil
+		return &library{*c}, nil
 	case repositorytype.WebsiteRepository:
-		return &website{c}, nil
+		return &website{*c}, nil
 	default:
 		return nil, fmt.Errorf("unexpected repository type `%d`", c.RepoType)
 	}

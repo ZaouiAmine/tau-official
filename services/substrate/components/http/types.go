@@ -11,4 +11,5 @@ type Service struct {
 	config      config.Config
 	cache       *cache.Cache
 	dvPublicKey []byte
+	inflight    *limiter // function requests in flight
 }

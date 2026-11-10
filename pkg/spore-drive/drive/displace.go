@@ -3,6 +3,7 @@ package drive
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -57,6 +58,8 @@ func probeDNSResolvers(ctx context.Context, r remoteHost) []string {
 }
 
 func (d *sporedrive) Displace(ctx context.Context, course course.Course) <-chan Progress {
+
+	logDNSRecords(d.parser)
 
 	hyphae := course.Hyphae()
 
@@ -394,6 +397,8 @@ func (d *sporedrive) uploadSystemdFile(h remoteHost) error {
 
 	unit := cnf.Section("Unit")
 	unit.Key("Description").SetValue("Taubyte Tau Service Running %i")
+	// Keep restarting after any number of quick failures: only exit 78 (below) is final.
+	unit.Key("StartLimitIntervalSec").SetValue("0")
 
 	service := cnf.Section("Service")
 	service.Key("Type").SetValue("simple")
@@ -408,6 +413,8 @@ func (d *sporedrive) uploadSystemdFile(h remoteHost) error {
 	service.Key("LimitNOFILE").SetValue("65536")
 	service.Key("Restart").SetValue("always")
 	service.Key("RestartSec").SetValue("1")
+	// a config error exits with 78 (EX_CONFIG): restarting it only fails again
+	service.Key("RestartPreventExitStatus").SetValue("78")
 
 	install := cnf.Section("Install")
 	install.Key("WantedBy").SetValue("multi-user.target")
@@ -497,6 +504,11 @@ func (d *sporedrive) displaceHandler(hypha *course.Hypha, progressCh chan<- Prog
 				err:      err,
 			}
 			return err
+		}
+
+		// Nodes refuse to start auth without a tenancy; fail before touching the host.
+		if d.parser.Tenancy().Owner() == "" {
+			return pushError("tenancy", errors.New("no tenancy configured: set tenancy.owner (and tenancy.app for an organization) in the spore-drive config before displacing"))
 		}
 
 		r, err := d.hostWrapper(ctx, h)
