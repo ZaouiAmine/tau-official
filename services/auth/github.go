@@ -458,12 +458,12 @@ func (srv *AuthService) getGitHubRecentProjects(ctx context.Context, client GitH
 			if err != nil || len(v) == 0 || seen[string(v)] {
 				continue
 			}
-			project, err := projects.Fetch(ctx, srv.KV(), string(v))
+			name, err := projects.Name(ctx, srv.KV(), string(v))
 			if err != nil {
 				continue
 			}
 			seen[string(v)] = true
-			projectsFound = append(projectsFound, ProjectInfo{ID: string(v), Name: project.Name()})
+			projectsFound = append(projectsFound, ProjectInfo{ID: string(v), Name: name})
 			if len(projectsFound) >= last {
 				return false
 			}
@@ -485,18 +485,16 @@ func (srv *AuthService) getGitHubUserProjects(ctx context.Context, client GitHub
 	for repo_id := range repos {
 		repo_key := fmt.Sprintf("/repositories/github/%s/project", repo_id)
 		v, err := srv.db.Get(ctx, repo_key)
-		if err == nil && len(v) > 0 {
-			project_id := string(v)
-
-			project, err := projects.Fetch(ctx, srv.KV(), project_id)
-			if err == nil {
-				if _, ok := user_projects[project_id]; !ok {
-					user_projects[project_id] = ProjectInfo{
-						ID:   project_id,
-						Name: project.Name(),
-					}
-				}
-			}
+		if err != nil || len(v) == 0 {
+			continue
+		}
+		project_id := string(v)
+		// A project has two repositories: read it once.
+		if _, ok := user_projects[project_id]; ok {
+			continue
+		}
+		if name, err := projects.Name(ctx, srv.KV(), project_id); err == nil {
+			user_projects[project_id] = ProjectInfo{ID: project_id, Name: name}
 		}
 	}
 

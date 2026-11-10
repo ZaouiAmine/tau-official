@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v71/github"
+	"golang.org/x/sync/singleflight"
 )
 
 // A caller's repositories are listed from GitHub, all of them, for every
@@ -28,8 +29,9 @@ type repoList struct {
 }
 
 var (
-	repoLists     = make(map[[sha256.Size]byte]repoList)
-	repoListsLock sync.Mutex
+	repoLists      = make(map[[sha256.Size]byte]repoList)
+	repoListsLock  sync.Mutex
+	repoListFlight singleflight.Group
 )
 
 func repoListKey(token string) [sha256.Size]byte { return sha256.Sum256([]byte("repos\x00" + token)) }
@@ -67,7 +69,10 @@ func forgetRepoList(client GitHubClient) {
 	}
 	repoListsLock.Lock()
 	defer repoListsLock.Unlock()
-	delete(repoLists, repoListKey(gc.Token))
+	key := repoListKey(gc.Token)
+	delete(repoLists, key)
+	// A walk already running began before this change: later callers start anew.
+	repoListFlight.Forget(string(key[:]))
 }
 
 // A repository read by id (and the caller's permissions on it) is kept per

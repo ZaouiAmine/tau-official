@@ -312,7 +312,21 @@ func (client *githubClient) ListMyRepos() (map[string]RepositoryBasicInfo, error
 	if cached, ok := cachedRepoList(client.Token); ok {
 		return maps.Clone(cached.repos), nil
 	}
+	if client.Token == "" {
+		return client.listMyRepos()
+	}
 
+	// Every create drops the cached list, so parallel sessions on one token
+	// each walked all its pages at once; those walks are now one.
+	key := repoListKey(client.Token)
+	v, err, _ := repoListFlight.Do(string(key[:]), func() (any, error) { return client.listMyRepos() })
+	if err != nil {
+		return nil, err
+	}
+	return maps.Clone(v.(map[string]RepositoryBasicInfo)), nil
+}
+
+func (client *githubClient) listMyRepos() (map[string]RepositoryBasicInfo, error) {
 	page := func(n int) ([]*github.Repository, *github.Response, error) {
 		opts := github.RepositoryListByAuthenticatedUserOptions{ListOptions: github.ListOptions{Page: n, PerPage: 100}, Sort: "created", Direction: "desc"}
 		return client.Repositories.ListByAuthenticatedUser(client.ctx, &opts)

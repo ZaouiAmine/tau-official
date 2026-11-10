@@ -100,6 +100,15 @@ func Exist(ctx context.Context, kv kvdb.KVDB, id string) bool {
 	return err == nil
 }
 
+// Name reads only a project's name; a listing has no use for the rest.
+func Name(ctx context.Context, kv kvdb.KVDB, id string) (string, error) {
+	name, err := kv.Get(ctx, fmt.Sprintf("/projects/%s/name", id))
+	if err != nil {
+		return "", fmt.Errorf("project `%s` not found", id)
+	}
+	return string(name), nil
+}
+
 // id: provided as string even if it's an int
 func Fetch(ctx context.Context, kv kvdb.KVDB, id string) (Project, error) {
 	logger.Debugf("Project.Fetch (%s)", id)
