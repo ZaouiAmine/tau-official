@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/taubyte/tau/clients/http"
 	client "github.com/taubyte/tau/clients/http/auth"
@@ -71,7 +72,9 @@ func loadClient() (config.Profile, *client.Client, error) {
 		return config.Profile{}, nil, err
 	}
 
-	ops := []http.Option{http.URL(url), http.Auth(profile.Token)}
+	// Auth gives a request 30s (GitHubTokenHTTPAuth); giving up sooner leaves
+	// the call's GitHub work done and unused, or a project half created.
+	ops := []http.Option{http.URL(url), http.Auth(profile.Token), http.Timeout(35 * time.Second)}
 	if strings.HasPrefix(url, "http://") {
 		ops = append(ops, http.UseDefaultTransport())
 	}
