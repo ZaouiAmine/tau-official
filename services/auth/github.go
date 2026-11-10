@@ -170,6 +170,14 @@ func (srv *AuthService) registerGitHubRepository(ctx context.Context, client Git
 
 	repoKey := fmt.Sprintf("/repositories/github/%s/key", repoID)
 
+	// Without a GitHub client the new key could not be installed: storing it
+	// would leave a key GitHub rejects with "Repository not found".
+	if client == nil {
+		if existing, err := srv.KV().Get(ctx, repoKey); err == nil && len(existing) > 0 {
+			return &RepositoryRegistrationResponse{Key: repoKey}, nil
+		}
+	}
+
 	hook_id := id.Generate(repoKey)
 	defaultHookName := "taubyte_push_hook"
 	defaultGithubHookUrl := srv.webHookUrl + "/github/" + hook_id
